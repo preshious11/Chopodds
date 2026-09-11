@@ -4,6 +4,7 @@
 
 # Cache
 .cache/
+.daily_cache/
 
 # Python
 __pycache__/

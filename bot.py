@@ -5,11 +5,13 @@ Automated daily predictions across diverse sports and betting markets.
 """
 
 import asyncio
-import html
 import logging
-from datetime import datetime, date, timezone
+from datetime import datetime
+
+from zoneinfo import ZoneInfo
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.constants import ChatAction
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -20,7 +22,12 @@ from telegram.error import BadRequest, TelegramError
 
 import config
 from predictions import generate_daily_predictions, get_top_picks, filter_by_sport
-from subscribers import add_subscriber, remove_subscriber, get_all_chat_ids, get_subscriber_join_date, get_bot_launch_date
+from subscribers import (
+    add_subscriber,
+    get_all_chat_ids,
+    get_subscriber_join_date,
+    get_bot_launch_date,
+)
 from stats import format_stats_message
 from formatters import (
     format_top_picks,
@@ -37,35 +44,103 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# Cache predictions per day
+# Africa/Lagos timezone for daily cache
+LAGOS_TZ = ZoneInfo("Africa/Lagos")
+
+# Cache predictions per day (Lagos date)
 _cached_predictions = None
 _cached_date = None
+_prediction_lock = asyncio.Lock()  # Prevents duplicate API calls from simultaneous users
+_is_generating = False  # Flag to show loading message
 
 
-def get_today_predictions() -> list:
-    """Get today's predictions (cached per day). STRICTLY FILTERED TO TODAY (UTC) ONLY."""
-    global _cached_predictions, _cached_date
+async def get_today_predictions() -> list:
+    """
+    Get today's predictions (cached per day, Africa/Lagos timezone).
+    Thread-safe: only the first concurrent caller triggers generation.
+    All subsequent calls (pagination, other users) read from cache.
+    """
+    global _cached_predictions, _cached_date, _is_generating
 
-    # Use UTC time for strict date comparison
-    now_utc = datetime.now(timezone.utc)
-    today_utc = now_utc.date()
+    # Use Africa/Lagos time for date determination
+    today_lagos = datetime.now(LAGOS_TZ).date()
 
-    if _cached_date != today_utc or _cached_predictions is None:
-        _cached_predictions = generate_daily_predictions(max_predictions=25)
-        _cached_date = today_utc
-        log.info(f"Generated {len(_cached_predictions)} predictions for {today_utc} (UTC)")
+    # Fast path: cache is valid
+    if _cached_date == today_lagos and _cached_predictions is not None:
+        return _cached_predictions
 
-    # STRICT FILTER: Ensure ALL predictions are for today (UTC) only
-    today_utc_str = today_utc.isoformat()
-    filtered = [p for p in _cached_predictions if p.get("date") == today_utc_str]
+    # Slow path: acquire lock to prevent duplicate API calls
+    async with _prediction_lock:
+        # Another task may have populated while we waited
+        if _cached_date == today_lagos and _cached_predictions is not None:
+            return _cached_predictions
 
-    if len(filtered) != len(_cached_predictions):
-        log.warning(
-            f"Filtered out {len(_cached_predictions) - len(filtered)} non-today predictions"
-        )
-        _cached_predictions = filtered
+        # We are the first caller — generate predictions
+        _is_generating = True
+        try:
+            _cached_predictions = generate_daily_predictions(max_predictions=20)
+            _cached_date = today_lagos
+            log.info(f"Generated {len(_cached_predictions)} predictions for {today_lagos} (Lagos)")
+        except (
+            ConnectionError,
+            TimeoutError,
+            OSError,
+            AttributeError,
+            IndexError,
+            KeyError,
+            TypeError,
+            ValueError,
+            ZeroDivisionError,
+        ) as e:
+            log.error(f"Network error generating predictions: {e}")
+            _cached_predictions = []
+        finally:
+            _is_generating = False
 
     return _cached_predictions
+
+
+def is_generating() -> bool:
+    """Check if predictions are currently being generated."""
+    return _is_generating
+
+
+def needs_refresh() -> bool:
+    """Check if predictions need to be fetched (cache is invalid or empty)."""
+    today_lagos = datetime.now(LAGOS_TZ).date()
+    return _cached_date != today_lagos or _cached_predictions is None
+
+async def _send_loading(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Send immediate feedback to the user while predictions are being fetched.
+    Always shows a typing indicator in the chat header.
+    Sends a visible loading message only when a fresh API fetch is expected.
+    Returns the loading message object (or None) so the caller can delete it later.
+    """
+    # Always show typing indicator — gives instant feedback even for cached responses
+    await context.bot.send_chat_action(
+        chat_id=update.effective_chat.id,
+        action=ChatAction.TYPING,
+    )
+
+    # Send a visible loading message only when a fresh fetch is expected
+    loading_msg = None
+    if needs_refresh() or is_generating():
+        loading_msg = await update.message.reply_text(
+            "🔍 Scanning markets for today's predictions...\n"
+            "⏳ This may take a moment..."
+        )
+    return loading_msg
+
+
+async def _clear_loading(loading_msg):
+    """Delete the loading message if it exists."""
+    if loading_msg:
+        try:
+            await loading_msg.delete()
+        except TelegramError:
+            pass
+
 
 # ============================================================================
 # Command Handlers
@@ -82,7 +157,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     subscriber_count = len(get_all_chat_ids())
 
     welcome_msg = (
-        f"🏆 <b>Welcome to Sports Predictions Bot!</b>\n\n"
+        f"🏆 <b>Welcome to BetVault!</b>\n\n"
         f"{'✅ You are now subscribed!' if is_new else '👋 Welcome back!'}\n"
         f"📊 Subscribers: <b>{subscriber_count}</b>\n\n"
         f"<b>Available Commands:</b>\n"
@@ -123,10 +198,12 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def dailypick(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /dailypick — show top 3-5 predictions for today."""
-    predictions = get_today_predictions()
+    loading_msg = await _send_loading(update, context)
+    predictions = await get_today_predictions()
     top = get_top_picks(predictions, count=config.DAILY_PICK_COUNT)
 
     if not top:
+        await _clear_loading(loading_msg)
         await update.message.reply_text(
             "⚠️ No predictions available for today's matches. Check back tomorrow morning!"
         )
@@ -140,6 +217,7 @@ async def dailypick(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
+    await _clear_loading(loading_msg)
     output, is_file = safe_message(msg)
     if is_file:
         await update.message.reply_document(
@@ -152,15 +230,17 @@ async def dailypick(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def toppicks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /toppicks — show paginated predictions."""
-    predictions = get_today_predictions()
+    loading_msg = await _send_loading(update, context)
+    predictions = await get_today_predictions()
 
     if not predictions:
+        await _clear_loading(loading_msg)
         await update.message.reply_text(
             "⚠️ No predictions available for today's matches. Check back tomorrow morning!"
         )
         return
 
-    await send_paginated_predictions(update, context, predictions, page=1)
+    await send_paginated_predictions(update, context, predictions, page=1, loading_msg=loading_msg)
 
 
 async def send_paginated_predictions(
@@ -168,6 +248,7 @@ async def send_paginated_predictions(
     context: ContextTypes.DEFAULT_TYPE,
     predictions: list,
     page: int = 1,
+    loading_msg=None,
 ):
     """Send or edit paginated predictions message."""
     msg, total_pages = format_all_picks_paginated(predictions, page=page, per_page=5)
@@ -203,6 +284,13 @@ async def send_paginated_predictions(
 
     reply_markup = InlineKeyboardMarkup(buttons)
 
+    # Delete loading message if present
+    if loading_msg:
+        try:
+            await loading_msg.delete()
+        except TelegramError:
+            pass
+
     try:
         if hasattr(update_or_query, "message"):
             # Called from command
@@ -223,7 +311,8 @@ async def send_paginated_predictions(
 
 async def sports_filter(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /sports — show sport filter buttons."""
-    predictions = get_today_predictions()
+    loading_msg = await _send_loading(update, context)
+    predictions = await get_today_predictions()
 
     # Build sport buttons
     sports = {}
@@ -242,6 +331,7 @@ async def sports_filter(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if row:
         keyboard.append(row)
 
+    await _clear_loading(loading_msg)
     reply_markup = InlineKeyboardMarkup(keyboard)
     await update.message.reply_text(
         format_sport_filter_buttons(predictions), parse_mode="HTML", reply_markup=reply_markup
@@ -285,7 +375,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Handle "top:p:X" — paginated all predictions
     if parts[0] == "top" and parts[1] == "p":
         page = int(parts[2])
-        predictions = get_today_predictions()
+        predictions = await get_today_predictions()
         await send_paginated_predictions(query, context, predictions, page=page)
         return
 
@@ -293,7 +383,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if parts[0] == "sport":
         sport = parts[1]
         page = int(parts[2])
-        predictions = get_today_predictions()
+        predictions = await get_today_predictions()
         filtered = filter_by_sport(predictions, sport)
         await send_filtered_predictions(query, context, filtered, sport, page=page)
         return
@@ -346,9 +436,6 @@ async def send_filtered_predictions(
             return
         raise
 
-    if data == "noop":
-        return
-
 # ============================================================================
 # Scheduler
 # ============================================================================
@@ -361,7 +448,7 @@ async def daily_broadcast(context: ContextTypes.DEFAULT_TYPE):
         log.info("No subscribers for daily broadcast")
         return
 
-    predictions = get_today_predictions()
+    predictions = await get_today_predictions()
     top = get_top_picks(predictions, count=config.DAILY_PICK_COUNT)
 
     if not top:

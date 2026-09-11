@@ -3,7 +3,6 @@ Subscriber management - stores chat IDs with UTC join timestamps.
 """
 
 import json
-import os
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import Lock
@@ -21,7 +20,7 @@ def _load_subscribers() -> dict:
     if not SUBSCRIBERS_FILE.exists():
         return {}
     try:
-        with open(SUBSCRIBERS_FILE, "r") as f:
+        with open(SUBSCRIBERS_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
     except (json.JSONDecodeError, IOError):
         return {}
@@ -29,7 +28,7 @@ def _load_subscribers() -> dict:
 
 def _save_subscribers(data: dict) -> None:
     """Save subscribers to JSON file."""
-    with open(SUBSCRIBERS_FILE, "w") as f:
+    with open(SUBSCRIBERS_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
 
 

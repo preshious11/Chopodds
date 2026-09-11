@@ -1,17 +1,25 @@
 """
 Historical prediction tracking and stats calculation.
 Calculates dynamic stats based on bot launch date and user join date.
+Uses Africa/Lagos timezone for date determination.
 """
 
 import json
-import random
-from datetime import datetime, timezone, date
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from threading import Lock
+
+from zoneinfo import ZoneInfo
 
 _lock = Lock()
 
 STATS_FILE = Path(__file__).resolve().parent / "stats.json"
+LAGOS_TZ = ZoneInfo("Africa/Lagos")
+
+
+def _today_lagos() -> date:
+    """Get today's date in Africa/Lagos timezone."""
+    return datetime.now(LAGOS_TZ).date()
 
 
 def _load_stats() -> dict:
@@ -19,7 +27,7 @@ def _load_stats() -> dict:
     if not STATS_FILE.exists():
         return {"history": {}, "last_updated": None}
     try:
-        with open(STATS_FILE, "r") as f:
+        with open(STATS_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
     except (json.JSONDecodeError, IOError):
         return {"history": {}, "last_updated": None}
@@ -27,7 +35,7 @@ def _load_stats() -> dict:
 
 def _save_stats(data: dict) -> None:
     """Save stats to JSON file."""
-    with open(STATS_FILE, "w") as f:
+    with open(STATS_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
 
 
@@ -52,7 +60,7 @@ def get_stats_since(since_date: date = None) -> dict:
                 "win_rate": 0,
             }
 
-        today = datetime.now(timezone.utc).date()
+        today = _today_lagos()
 
         # Determine the start date
         if since_date is None:
@@ -89,7 +97,7 @@ def get_daily_record(day: date = None) -> dict:
     """Get record for a specific day."""
     with _lock:
         data = _load_stats()
-        day_str = (day or datetime.now(timezone.utc).date()).isoformat()
+        day_str = (day or _today_lagos()).isoformat()
         return data.get("history", {}).get(day_str, {"total": 0, "won": 0, "lost": 0, "win_rate": 0})
 
 
@@ -123,8 +131,9 @@ def format_stats_message(bot_launch_date: datetime, user_joined_at: datetime = N
         bot_launch_date: When the bot was launched (UTC)
         user_joined_at: When the current user joined (UTC), None if not subscribed
     """
-    now = datetime.now(timezone.utc)
+    now = datetime.now(LAGOS_TZ)
     today = now.date()
+    yesterday = today - timedelta(days=1)
 
     # Calculate bot age
     bot_launch_date_only = bot_launch_date.date()
@@ -133,7 +142,18 @@ def format_stats_message(bot_launch_date: datetime, user_joined_at: datetime = N
     # Get bot-wide stats since launch
     bot_stats = get_stats_since(bot_launch_date_only)
 
+    # Get yesterday's record
+    yesterday_record = get_daily_record(yesterday)
+
     msg = "📊 <b>BOT PERFORMANCE & YOUR STATS</b>\n\n"
+
+    # Yesterday's result (simple format)
+    if yesterday_record["total"] > 0:
+        msg += f"📅 <b>Yesterday ({yesterday.strftime('%Y-%m-%d')}):</b> "
+        msg += f"<code>{yesterday_record['won']} out of {yesterday_record['total']} won</code>\n"
+        if yesterday_record["win_rate"] > 0:
+            msg += f"   Win Rate: <code>{yesterday_record['win_rate']}%</code>\n"
+        msg += "\n"
 
     # Bot overall performance
     msg += "<b>🤖 Bot Overall Performance</b>\n"

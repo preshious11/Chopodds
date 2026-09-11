@@ -112,3 +112,14 @@ def _calculate_confidence(odds):
         return round(random.uniform(0.55, 0.75), 2)
     else:
         return round(random.uniform(0.45, 0.65), 2)
+'''
+
+def main() -> None:
+    """Write the generated module only when this utility is run directly."""
+    output_path = pathlib.Path(__file__).parent / "predictions.py"
+    output_path.write_text(content, encoding="utf-8")
+    print(f"Generated {output_path} successfully!")
+
+
+if __name__ == "__main__":
+    main()

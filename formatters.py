@@ -5,8 +5,16 @@ Clean, production-ready formatting without developer labels.
 
 import html
 import io
-from datetime import datetime, timezone
-from typing import List, Dict
+from datetime import datetime
+
+from zoneinfo import ZoneInfo
+
+LAGOS_TZ = ZoneInfo("Africa/Lagos")
+
+
+def _today_lagos_str() -> str:
+    """Get today's date string in Africa/Lagos timezone."""
+    return datetime.now(LAGOS_TZ).strftime("%Y-%m-%d")
 
 
 def escape(text: str) -> str:
@@ -16,12 +24,17 @@ def escape(text: str) -> str:
 
 def _confidence_emoji(confidence: float) -> str:
     """Return emoji indicator based on confidence level."""
-    if confidence >= 0.80:
+    if confidence >= 0.70:
         return "🟢"
-    elif confidence >= 0.65:
+    elif confidence >= 0.50:
         return "🟡"
     else:
         return "🟠"
+
+
+def _confidence_tier_label(pred: dict) -> str:
+    """Return the confidence tier label for a prediction."""
+    return pred.get("confidence_tier", "")
 
 
 def format_single_prediction(pred: dict, index: int = None) -> str:
@@ -29,42 +42,45 @@ def format_single_prediction(pred: dict, index: int = None) -> str:
     prefix = f"{index}. " if index else ""
     confidence_pct = int(pred["confidence"] * 100)
     confidence_emoji = _confidence_emoji(pred["confidence"])
+    tier_label = _confidence_tier_label(pred)
 
     msg = (
         f"{prefix}{pred['sport_icon']} <b>{escape(pred['league'])}</b>\n"
         f"   🏟️ {escape(pred['match'])}\n"
         f"   📊 Market: {escape(pred['market_label'])} → <b>{escape(pred['pick'])}</b>\n"
         f"   💰 Odds: <b>{pred['odds']}</b> | 🎯 Confidence: <b>{confidence_pct}%</b> {confidence_emoji}\n"
+        f"   🏷️ Tier: <b>{tier_label}</b>\n"
         f"   🕐 {escape(pred['match_time'])}\n"
     )
     return msg
 
 
-def format_top_picks(predictions: List[dict], count: int = 5) -> str:
+def format_top_picks(predictions: list, count: int = 5) -> str:
     """Format top picks as an HTML message — clean and professional."""
-    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    today_str = _today_lagos_str()
     picks = predictions[:count]
 
     msg = f"🏆 <b>Top Picks for {today_str}</b>\n\n"
 
+    total_odds = 0
     for i, pred in enumerate(picks, 1):
         msg += format_single_prediction(pred, i)
         msg += "\n"
+        total_odds += pred['odds']
 
-    msg += f"<i>Showing top {len(picks)} of {len(predictions)} predictions</i>\n"
-    msg += "<i>Picks refresh daily at 00:00 UTC</i>"
+    msg += f"<i>Combined Odds: <b>{total_odds:.2f}</b></i>"
 
     return msg
 
 
-def format_all_picks_paginated(predictions: List[dict], page: int = 1, per_page: int = 5) -> tuple:
+def format_all_picks_paginated(predictions: list, page: int = 1, per_page: int = 5) -> tuple:
     """
     Format predictions into paginated pages.
 
     Returns:
         Tuple of (message_text, total_pages)
     """
-    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    today_str = _today_lagos_str()
     total_pages = max(1, (len(predictions) + per_page - 1) // per_page)
     page = max(1, min(page, total_pages))
 
@@ -79,10 +95,14 @@ def format_all_picks_paginated(predictions: List[dict], page: int = 1, per_page:
         msg += format_single_prediction(pred, i)
         msg += "\n"
 
+    # Add combined odds for ALL predictions (not just current page)
+    total_odds = sum(p['odds'] for p in predictions)
+    msg += f"<i>Combined Odds (All {len(predictions)} picks): <b>{total_odds:.2f}</b></i>"
+
     return msg, total_pages
 
 
-def format_sport_filter_buttons(predictions: List[dict]) -> str:
+def format_sport_filter_buttons(predictions: list) -> str:
     """Return sport filter message with active sports."""
     sports = {}
     for pred in predictions:
@@ -93,7 +113,7 @@ def format_sport_filter_buttons(predictions: List[dict]) -> str:
     if not sports:
         return "⚠️ <b>No predictions available for today. Check back tomorrow morning!</b>"
 
-    sport_list = ", ".join([f"{icon} {name}" for name, icon in sports.items()])
+    sport_list = ", ".join(f"{icon} {name}" for name, icon in sports.items())
     msg = f"⚽ <b>Select a sport to view today's predictions:</b>\n\n"
     msg += f"<i>Available: {sport_list}</i>"
     return msg

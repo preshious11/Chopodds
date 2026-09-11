@@ -5,6 +5,7 @@
 # Cache
 .cache/
 .daily_cache/
+prediction_tracking.db
 
 # Python
 __pycache__/

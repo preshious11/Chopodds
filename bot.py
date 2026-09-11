@@ -6,7 +6,10 @@ Automated daily predictions across diverse sports and betting markets.
 
 import asyncio
 import logging
-from datetime import datetime
+import signal
+import sys
+from datetime import datetime, timezone
+from logging.handlers import TimedRotatingFileHandler
 
 from zoneinfo import ZoneInfo
 
@@ -21,14 +24,23 @@ from telegram.ext import (
 from telegram.error import BadRequest, TelegramError
 
 import config
+from daily_cache import (
+    CACHE_DIR,
+    ensure_populated,
+    get_cached_odds,
+    get_lagos_date_str,
+    validate_daily_cache,
+)
+from odds_client import _fetch_all_sports_odds
+from settlement import settle_pending_predictions
+import tracking
 from predictions import generate_daily_predictions, get_top_picks, filter_by_sport
 from subscribers import (
     add_subscriber,
     get_all_chat_ids,
     get_subscriber_join_date,
-    get_bot_launch_date,
 )
-from stats import format_stats_message
+from stats import format_stats_message, record_prediction_delivery
 from formatters import (
     format_top_picks,
     format_all_picks_paginated,
@@ -38,14 +50,41 @@ from formatters import (
     format_single_prediction,
 )
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-)
+def configure_logging() -> None:
+    """Send application logs to stdout and a daily rotating log file."""
+    formatter = logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+    )
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.INFO)
+
+    if not any(getattr(handler, "_sportsbot_stdout", False)
+               for handler in root_logger.handlers):
+        stdout_handler = logging.StreamHandler(sys.stdout)
+        stdout_handler._sportsbot_stdout = True
+        stdout_handler.setFormatter(formatter)
+        root_logger.addHandler(stdout_handler)
+
+    if not any(getattr(handler, "_sportsbot_file", False)
+               for handler in root_logger.handlers):
+        file_handler = TimedRotatingFileHandler(
+            "bot_activity.log",
+            when="midnight",
+            backupCount=7,
+            encoding="utf-8",
+            utc=False,
+        )
+        file_handler._sportsbot_file = True
+        file_handler.setFormatter(formatter)
+        root_logger.addHandler(file_handler)
+
+
+configure_logging()
 log = logging.getLogger(__name__)
 
 # Africa/Lagos timezone for daily cache
 LAGOS_TZ = ZoneInfo("Africa/Lagos")
+_BOT_STARTED_AT = datetime.now(timezone.utc)
 
 # Cache predictions per day (Lagos date)
 _cached_predictions = None
@@ -79,6 +118,7 @@ async def get_today_predictions() -> list:
         _is_generating = True
         try:
             _cached_predictions = generate_daily_predictions(max_predictions=20)
+            tracking.record_predictions(_cached_predictions)
             _cached_date = today_lagos
             log.info(f"Generated {len(_cached_predictions)} predictions for {today_lagos} (Lagos)")
         except (
@@ -227,6 +267,8 @@ async def dailypick(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     else:
         await update.message.reply_text(output, parse_mode="HTML", reply_markup=reply_markup)
+    record_prediction_delivery(update.effective_user.id, top)
+    tracking.record_predictions(top, update.effective_user.id)
 
 async def toppicks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /toppicks — show paginated predictions."""
@@ -302,6 +344,9 @@ async def send_paginated_predictions(
             await update_or_query.edit_message_text(
                 msg, parse_mode="HTML", reply_markup=reply_markup
             )
+        if hasattr(update_or_query, "message"):
+            record_prediction_delivery(update_or_query.effective_user.id, predictions)
+            tracking.record_predictions(predictions, update_or_query.effective_user.id)
     except BadRequest as e:
         if "Message is not modified" in str(e):
             return  # Ignore double-click
@@ -336,21 +381,57 @@ async def sports_filter(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         format_sport_filter_buttons(predictions), parse_mode="HTML", reply_markup=reply_markup
     )
+    record_prediction_delivery(update.effective_user.id, predictions)
+    tracking.record_predictions(predictions, update.effective_user.id)
 
 
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /stats — show dynamic stats based on bot launch date and user join date."""
+    """Show global performance and this user's delivery statistics."""
     chat_id = update.effective_chat.id
-
-    # Get bot launch date
-    bot_launch_date = get_bot_launch_date()
-
-    # Get user's join date (if subscribed)
     user_joined_at = get_subscriber_join_date(chat_id)
-
-    # Format stats message with dynamic dates
-    msg = format_stats_message(bot_launch_date=bot_launch_date, user_joined_at=user_joined_at)
+    msg = format_stats_message(user_id=chat_id, user_joined_at=user_joined_at)
     await update.message.reply_text(msg, parse_mode="HTML")
+
+
+async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Report bot health and today's cache metrics to the administrator."""
+    user = update.effective_user
+    if user is None or user.id != config.ADMIN_CHAT_ID:
+        return
+
+    cache_path = CACHE_DIR / f"odds_{get_lagos_date_str()}.json"
+    cache_exists = cache_path.exists()
+    cached_odds = get_cached_odds() if cache_exists else {}
+    cached_sports = sum(1 for events in cached_odds.values() if events)
+    cached_matches = sum(
+        len(events) for events in cached_odds.values() if isinstance(events, list)
+    )
+    uptime = datetime.now(timezone.utc) - _BOT_STARTED_AT
+    uptime_seconds = max(0, int(uptime.total_seconds()))
+    uptime_days, remainder = divmod(uptime_seconds, 86400)
+    uptime_hours, remainder = divmod(remainder, 3600)
+    uptime_minutes, seconds = divmod(remainder, 60)
+    uptime_text = (
+        f"{uptime_days}d {uptime_hours}h {uptime_minutes}m {seconds}s"
+    )
+    status = "HEALTHY" if cache_exists else "DEGRADED"
+    cache_size = cache_path.stat().st_size if cache_exists else 0
+    tracking_health = tracking.get_health_metrics()
+
+    message = (
+        "🩺 <b>Bot Status</b>\n\n"
+        f"<b>Overall:</b> {status}\n"
+        f"<b>Uptime:</b> {uptime_text}\n"
+        f"<b>Cache date:</b> {get_lagos_date_str()}\n"
+        f"<b>Cache file:</b> {cache_path.name}\n"
+        f"<b>Cache size:</b> {cache_size:,} bytes\n"
+        f"<b>Cached sports:</b> {cached_sports}\n"
+        f"<b>Cached matches:</b> {cached_matches}\n"
+        f"<b>Pending settlements:</b> {tracking_health['pending']}\n"
+        f"<b>Settled predictions:</b> {tracking_health['settled']}\n"
+        f"<b>Last score fetch:</b> {tracking_health['last_score_fetch']}"
+    )
+    await update.message.reply_text(message, parse_mode="HTML")
 
 
 # ============================================================================
@@ -478,6 +559,8 @@ async def daily_broadcast(context: ContextTypes.DEFAULT_TYPE):
                 text=msg,
                 parse_mode="HTML",
             )
+            record_prediction_delivery(chat_id, top)
+            tracking.record_predictions(top, chat_id)
             sent += 1
         except TelegramError as e:
             log.warning(f"Failed to send broadcast to {chat_id}: {e}")
@@ -486,14 +569,42 @@ async def daily_broadcast(context: ContextTypes.DEFAULT_TYPE):
     log.info(f"Daily broadcast sent: {sent} success, {failed} failed")
 
 
+async def settlement_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Run the non-blocking pending-prediction settlement check."""
+    await settle_pending_predictions()
+
+
 # ============================================================================
 # Main Entry Point
 # ============================================================================
 
 
-def main():
-    """Start the bot."""
+async def run_bot() -> None:
+    """Start the bot and shut it down cleanly on termination signals."""
     app = Application.builder().token(config.TELEGRAM_BOT_TOKEN).build()
+    shutdown_event = asyncio.Event()
+
+    def request_shutdown() -> None:
+        log.info("Shutdown signal received; shutting down gracefully...")
+        shutdown_event.set()
+
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGINT, getattr(signal, "SIGTERM", None)):
+        if sig is None:
+            continue
+        try:
+            loop.add_signal_handler(sig, request_shutdown)
+        except NotImplementedError:
+            signal.signal(
+                sig,
+                lambda _signal_number, _frame: loop.call_soon_threadsafe(
+                    request_shutdown
+                ),
+            )
+
+    if not validate_daily_cache():
+        log.info("Daily odds cache is missing or invalid; regenerating it")
+        await asyncio.to_thread(ensure_populated, _fetch_all_sports_odds)
 
     # Command handlers
     app.add_handler(CommandHandler("start", start))
@@ -503,6 +614,7 @@ def main():
     app.add_handler(CommandHandler("top", toppicks))
     app.add_handler(CommandHandler("sports", sports_filter))
     app.add_handler(CommandHandler("stats", stats_command))
+    app.add_handler(CommandHandler("status", status_command))
 
     # Callback handler for inline buttons
     app.add_handler(CallbackQueryHandler(button_callback))
@@ -518,12 +630,37 @@ def main():
             time=dt_time(hour=hour, minute=minute),
             name="daily_broadcast",
         )
+        app.job_queue.run_repeating(
+            settlement_job,
+            interval=12 * 60 * 60,
+            first=60,
+            name="settle_pending_predictions",
+        )
         log.info(f"Daily broadcast scheduled at {config.DAILY_BROADCAST_TIME} UTC")
     else:
         log.warning("Job queue not available — daily broadcast disabled")
 
     log.info("Bot starting...")
-    app.run_polling()
+    await app.initialize()
+    await app.start()
+    await app.updater.start_polling()
+
+    try:
+        await shutdown_event.wait()
+    finally:
+        log.info("Stopping Telegram polling and scheduled jobs")
+        await app.updater.stop()
+        await app.stop()
+        await app.shutdown()
+        log.info("Bot shutdown complete")
+
+
+def main() -> None:
+    """Run the asynchronous bot lifecycle."""
+    try:
+        asyncio.run(run_bot())
+    except KeyboardInterrupt:
+        log.info("Bot interrupted by keyboard")
 
 
 if __name__ == "__main__":

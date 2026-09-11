@@ -34,23 +34,26 @@ def _confidence_emoji(confidence: float) -> str:
 
 def _confidence_tier_label(pred: dict) -> str:
     """Return the confidence tier label for a prediction."""
-    return pred.get("confidence_tier", "")
+    tier = pred.get("confidence_tier", "")
+    return {
+        "High Confidence": "High",
+        "Moderate Confidence": "Moderate",
+        "Value Pick": "Value",
+    }.get(tier, tier or "Value")
 
 
 def format_single_prediction(pred: dict, index: int = None) -> str:
-    """Format a single prediction as HTML — clean and professional."""
+    """Format one prediction with compact match, selection, and timing copy."""
     prefix = f"{index}. " if index else ""
     confidence_pct = int(pred["confidence"] * 100)
     confidence_emoji = _confidence_emoji(pred["confidence"])
     tier_label = _confidence_tier_label(pred)
 
     msg = (
-        f"{prefix}{pred['sport_icon']} <b>{escape(pred['league'])}</b>\n"
-        f"   🏟️ {escape(pred['match'])}\n"
-        f"   📊 Market: {escape(pred['market_label'])} → <b>{escape(pred['pick'])}</b>\n"
-        f"   💰 Odds: <b>{pred['odds']}</b> | 🎯 Confidence: <b>{confidence_pct}%</b> {confidence_emoji}\n"
-        f"   🏷️ Tier: <b>{tier_label}</b>\n"
-        f"   🕐 {escape(pred['match_time'])}\n"
+        f"{prefix}{pred['sport_icon']} <b>{escape(pred['match'])}</b>\n"
+        f"   Selection: <b>{escape(pred['pick'])}</b>\n"
+        f"   Odds: <b>{pred['odds']}</b> | Confidence: <b>{confidence_pct}%</b> {confidence_emoji} <b>{tier_label}</b>\n"
+        f"   Kickoff: {escape(pred['match_time'])} · {escape(pred['league'])}\n"
     )
     return msg
 

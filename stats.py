@@ -11,6 +11,8 @@ from threading import Lock
 
 from zoneinfo import ZoneInfo
 
+import tracking
+
 _lock = Lock()
 
 STATS_FILE = Path(__file__).resolve().parent / "stats.json"
@@ -50,10 +52,12 @@ def get_stats_since(since_date: date = None) -> dict:
     with _lock:
         data = _load_stats()
         history = data.get("history", {})
+        generated_total = len(data.get("generated_predictions", []))
 
         if not history:
             return {
                 "period_days": 0,
+                "generated": generated_total,
                 "total": 0,
                 "won": 0,
                 "lost": 0,
@@ -85,6 +89,7 @@ def get_stats_since(since_date: date = None) -> dict:
 
         return {
             "period_days": period_days,
+            "generated": generated_total,
             "total": total_predictions,
             "won": total_won,
             "lost": total_lost,
@@ -123,70 +128,131 @@ def record_prediction_result(day: date, won: bool):
         _save_stats(data)
 
 
-def format_stats_message(bot_launch_date: datetime, user_joined_at: datetime = None) -> str:
-    """
-    Format stats as an HTML message with dynamic date ranges.
+def record_prediction_delivery(user_id: int, predictions: list) -> None:
+    """Record unique predictions delivered to a user for future settlement."""
+    if not predictions:
+        return
+    with _lock:
+        data = _load_stats()
+        generated_predictions = data.setdefault("generated_predictions", [])
+        users = data.setdefault("users", {})
+        user = users.setdefault(
+            str(user_id), {"generated": 0, "won": 0, "lost": 0, "delivered": []}
+        )
+        delivered = set(user.get("delivered", []))
+        new_ids = {
+            str(prediction.get("event_id") or prediction.get("match"))
+            for prediction in predictions
+            if prediction.get("event_id") or prediction.get("match")
+        } - delivered
+        for event_id in new_ids:
+            if event_id not in generated_predictions:
+                generated_predictions.append(event_id)
+        user["delivered"] = sorted(delivered | new_ids)
+        user["generated"] = len(user["delivered"])
+        pending = data.setdefault("pending", {})
+        for prediction in predictions:
+            event_id = prediction.get("event_id") or prediction.get("match")
+            if not event_id:
+                continue
+            pending.setdefault(
+                str(event_id),
+                {
+                    "event_id": str(event_id),
+                    "league": prediction.get("league", ""),
+                    "match": prediction.get("match", ""),
+                    "home_team": prediction.get("home_team", ""),
+                    "away_team": prediction.get("away_team", ""),
+                    "market_type": prediction.get("market_type", ""),
+                    "pick": prediction.get("pick", ""),
+                    "recipients": [],
+                },
+            )
+            recipients = pending[str(event_id)].setdefault("recipients", [])
+            if user_id not in recipients:
+                recipients.append(user_id)
+        data["last_updated"] = datetime.now(timezone.utc).isoformat()
+        _save_stats(data)
 
-    Args:
-        bot_launch_date: When the bot was launched (UTC)
-        user_joined_at: When the current user joined (UTC), None if not subscribed
-    """
-    now = datetime.now(LAGOS_TZ)
-    today = now.date()
-    yesterday = today - timedelta(days=1)
 
-    # Calculate bot age
-    bot_launch_date_only = bot_launch_date.date()
-    bot_age_days = (today - bot_launch_date_only).days + 1
+def get_pending_predictions() -> list:
+    """Return predictions delivered to users but not settled yet."""
+    with _lock:
+        return list(_load_stats().get("pending", {}).values())
 
-    # Get bot-wide stats since launch
-    bot_stats = get_stats_since(bot_launch_date_only)
 
-    # Get yesterday's record
-    yesterday_record = get_daily_record(yesterday)
+def record_prediction_settlement(event_id: str, result: str, settled_day: date) -> None:
+    """Apply one settlement to global and recipient user statistics."""
+    if result not in {"win", "loss", "void"}:
+        return
+    with _lock:
+        data = _load_stats()
+        pending = data.setdefault("pending", {})
+        prediction = pending.pop(str(event_id), None)
+        if prediction is None:
+            return
 
-    msg = "📊 <b>BOT PERFORMANCE & YOUR STATS</b>\n\n"
+        if result == "void":
+            data["last_updated"] = datetime.now(timezone.utc).isoformat()
+            _save_stats(data)
+            return
 
-    # Yesterday's result (simple format)
-    if yesterday_record["total"] > 0:
-        msg += f"📅 <b>Yesterday ({yesterday.strftime('%Y-%m-%d')}):</b> "
-        msg += f"<code>{yesterday_record['won']} out of {yesterday_record['total']} won</code>\n"
-        if yesterday_record["win_rate"] > 0:
-            msg += f"   Win Rate: <code>{yesterday_record['win_rate']}%</code>\n"
-        msg += "\n"
+        history = data.setdefault("history", {})
+        entry = history.setdefault(
+            settled_day.isoformat(), {"total": 0, "won": 0, "lost": 0, "win_rate": 0}
+        )
+        entry["total"] += 1
+        entry["won" if result == "win" else "lost"] += 1
+        entry["win_rate"] = round(entry["won"] / entry["total"] * 100, 1)
 
-    # Bot overall performance
-    msg += "<b>🤖 Bot Overall Performance</b>\n"
-    msg += f"• Bot Online For: <code>{bot_age_days} days</code>\n"
-    msg += f"• Total Predictions Made: <code>{bot_stats['total']}</code>\n"
-    if bot_stats['total'] > 0:
-        msg += f"• Bot Win Rate: <code>{bot_stats['win_rate']}%</code> ({bot_stats['won']}/{bot_stats['total']})\n"
-    else:
-        msg += "• Bot Win Rate: <code>No data yet</code>\n"
+        for user_id in prediction.get("recipients", []):
+            user = data.setdefault("users", {}).setdefault(
+                str(user_id), {"generated": 0, "won": 0, "lost": 0, "delivered": []}
+            )
+            if result == "win":
+                user["won"] += 1
+            else:
+                user["lost"] += 1
 
-    msg += "\n"
+        data["last_updated"] = datetime.now(timezone.utc).isoformat()
+        _save_stats(data)
 
-    # Personal stats
-    msg += "<b>👤 Your Personal Subscription Stats</b>\n"
 
+def get_user_stats(user_id: int) -> dict:
+    """Return delivery and settled-result totals for one user."""
+    with _lock:
+        data = _load_stats()
+        user = data.get("users", {}).get(str(user_id), {})
+        won = user.get("won", 0)
+        lost = user.get("lost", 0)
+        settled = won + lost
+        return {
+            "generated": user.get("generated", len(user.get("delivered", []))),
+            "won": won,
+            "lost": lost,
+            "settled": settled,
+            "win_rate": round(won / settled * 100, 1) if settled else 0,
+        }
+
+
+def format_stats_message(user_id: int, user_joined_at: datetime = None) -> str:
+    """Format global and user-specific performance statistics."""
+    bot_stats = tracking.get_global_stats()
+    user_stats = tracking.get_user_stats(user_id, user_joined_at)
+    message = (
+        "📊 <b>Performance Summary</b>\n\n"
+        "<b>ALL-TIME BOT STATS</b>\n"
+        f"• Predictions generated: <code>{bot_stats['generated']}</code>\n"
+        f"• Wins / losses: <code>{bot_stats['wins']} / {bot_stats['losses']}</code>\n"
+        f"• Overall win rate: <code>{bot_stats['win_rate']}%</code>\n\n"
+        "<b>YOUR PERSONAL STATS</b>\n"
+    )
     if user_joined_at is None:
-        msg += "• Status: <code>Not subscribed</code>\n"
-        msg += "• Use /start to subscribe and track your stats!\n"
-    else:
-        user_joined_date = user_joined_at.date()
-        user_active_days = (today - user_joined_date).days + 1
-        user_joined_date_str = user_joined_date.strftime("%Y-%m-%d")
-
-        # Get user-specific stats since they joined
-        user_stats = get_stats_since(user_joined_date)
-
-        msg += f"• Subscribed Since: <code>{user_joined_date_str}</code> ({user_active_days} days active)\n"
-        msg += f"• Predictions Delivered To You: <code>{user_stats['total']}</code>\n"
-
-        if user_stats['total'] > 0:
-            msg += f"• Your Record: <code>{user_stats['won']} Won / {user_stats['lost']} Lost</code>\n"
-            msg += f"• Your Personal Win Rate: <code>{user_stats['win_rate']}%</code>\n"
-        else:
-            msg += "• Your Personal Win Rate: <code>No settled predictions yet</code>\n"
-
-    return msg
+        return message + "• Status: <code>Not subscribed</code>\n"
+    joined = user_joined_at.astimezone(LAGOS_TZ).strftime("%Y-%m-%d")
+    return message + (
+        f"• Active member since: <code>{joined}</code>\n"
+        f"• Predictions generated for you: <code>{user_stats['generated']}</code>\n"
+        f"• Your predictions settled: <code>{user_stats['won']} / {user_stats['lost']}</code>\n"
+        f"• Your win rate: <code>{user_stats['win_rate']}%</code>"
+    )

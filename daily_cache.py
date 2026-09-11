@@ -11,7 +11,7 @@ historical reference and cleaned up after configurable retention period.
 
 import json
 import logging
-from datetime import datetime, date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from threading import Lock
 
@@ -61,6 +61,41 @@ def get_cached_odds() -> dict:
         return {}
 
 
+def validate_daily_cache() -> bool:
+    """Validate today's cache file and quarantine it if it is corrupted.
+
+    Returns ``True`` only when the file contains today's date and a mapping of
+    sport keys to cached odds. Invalid files are renamed so the next cache
+    population can safely regenerate them.
+    """
+    cache_path = _get_cache_path()
+    if not cache_path.exists():
+        return False
+
+    try:
+        with open(cache_path, "r", encoding="utf-8") as file:
+            data = json.load(file)
+        if (
+            not isinstance(data, dict)
+            or data.get("date") != get_lagos_date_str()
+            or not isinstance(data.get("sports"), dict)
+        ):
+            raise ValueError("cache metadata or sports data is invalid")
+        return True
+    except (json.JSONDecodeError, OSError, ValueError) as exc:
+        logger.warning("Daily odds cache is corrupted; regenerating it: %s", exc)
+        quarantine_path = cache_path.with_name(
+            f"{cache_path.name}.corrupt-"
+            f"{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}"
+        )
+        try:
+            cache_path.replace(quarantine_path)
+            logger.warning("Quarantined corrupted cache as %s", quarantine_path.name)
+        except OSError as quarantine_error:
+            logger.error("Could not quarantine corrupted cache: %s", quarantine_error)
+        return False
+
+
 def set_cached_odds(sports_data: dict) -> None:
     """
     Store today's odds data for all sports.
@@ -88,8 +123,7 @@ def set_cached_odds(sports_data: dict) -> None:
 
 def is_cache_valid() -> bool:
     """Check if today's cache exists and is valid (Lagos date)."""
-    cache_path = _get_cache_path()
-    return cache_path.exists()
+    return validate_daily_cache()
 
 
 def ensure_populated(fetch_fn) -> dict:

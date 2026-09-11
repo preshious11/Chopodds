@@ -68,9 +68,8 @@ judge for yourself, instead of trusting an inflated claim.
 - `probability.py` is where you'd plug in your own model (Poisson goal
   models, Elo ratings, etc.) instead of relying purely on bookmaker
   consensus
-- `picks.py` currently only checks the `h2h` market — you can add
-  `spreads` or `totals` by passing a different `market` value into
-  `get_odds()`
+- Probabilities are calculated in `probability.py` — you can plug in your
+  own models (Poisson goal models, Elo ratings, etc.) there
 - Swap `run_polling()` for a webhook setup in `bot.py` if you deploy to
   a server instead of running locally
 

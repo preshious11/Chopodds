@@ -30,6 +30,8 @@ ODDS_REGIONS = os.environ.get("ODDS_REGIONS", "uk,eu,us,au")
 ODDS_MARKETS = os.environ.get("ODDS_MARKETS", "h2h,spreads,totals,btts,double_chance,draw_no_bet")
 
 # Bot Configuration
+ADMIN_CHAT_ID = int(os.environ.get("ADMIN_CHAT_ID", "0").strip() or "0")
+
 # Number of top picks to show in /dailypick and daily broadcast (3-5 recommended)
 DAILY_PICK_COUNT = int(os.environ.get("DAILY_PICK_COUNT", "5"))
 

@@ -8,6 +8,7 @@ import asyncio
 import logging
 import signal
 import sys
+import time
 from datetime import datetime, timezone
 from logging.handlers import TimedRotatingFileHandler
 
@@ -21,7 +22,7 @@ from telegram.ext import (
     CallbackQueryHandler,
     ContextTypes,
 )
-from telegram.error import BadRequest, TelegramError
+from telegram.error import BadRequest, TelegramError, NetworkError, TimedOut
 
 import config
 from daily_cache import (
@@ -736,6 +737,31 @@ async def settlement_job(context: ContextTypes.DEFAULT_TYPE) -> None:
 # ============================================================================
 
 
+async def log_handler_error(update: object, context: ContextTypes.DEFAULT_TYPE):
+    """Log exceptions raised inside command/button handlers.
+
+    Includes the update that triggered it and the full traceback so
+    Railway logs show exactly which handler failed and why.
+    """
+    log.error(
+        "Handler exception while processing update",
+        exc_info=context.error,
+    )
+    try:
+        if isinstance(update, Update) and update.effective_message:
+            origin = ""
+            if update.callback_query and update.callback_query.data:
+                origin = f" callback={update.callback_query.data!r}"
+            elif update.effective_message:
+                text = update.effective_message.text or ""
+                origin = f" message={text[:60]!r}"
+            log.error(f"  from chat_id={chat.id if chat else '?'} ... {origin}")
+    except Exception:
+        pass
+    # Users never see error details — the failure is logged for the admin
+    # and surfaced later via /status. The handler simply stays silent.
+
+
 async def run_bot() -> None:
     """Start the bot and shut it down cleanly on termination signals."""
     app = Application.builder().token(config.TELEGRAM_BOT_TOKEN).build()
@@ -777,6 +803,10 @@ async def run_bot() -> None:
     # Callback handler for inline buttons
     app.add_handler(CallbackQueryHandler(button_callback))
 
+    # Log handler exceptions with full tracebacks — without this, errors
+    # like the /stats KeyError vanished from the logs (fixed 2026-09-12).
+    app.add_error_handler(log_handler_error)
+
     # Schedule daily broadcast using PTB's JobQueue
     if app.job_queue:
         # Parse broadcast time — interpreted in Africa/Lagos timezone
@@ -804,9 +834,24 @@ async def run_bot() -> None:
         log.warning("Job queue not available — daily broadcast disabled")
 
     log.info("Bot starting...")
-    await app.initialize()
-    await app.start()
-    await app.updater.start_polling()
+    # Retry the Telegram handshake — a single network blip during get_me()
+    # used to crash the whole process (seen in local test 2026-09-12).
+    handshake_attempts = 5
+    for attempt in range(1, handshake_attempts + 1):
+        try:
+            await app.initialize()
+            await app.start()
+            await app.updater.start_polling()
+            break
+        except (TimedOut, NetworkError) as exc:
+            if attempt == handshake_attempts:
+                raise
+            wait = attempt * 5
+            log.warning(
+                f"Telegram connection failed on startup attempt {attempt}/"
+                f"{handshake_attempts} ({exc!r}); retrying in {wait}s"
+            )
+            await asyncio.sleep(wait)
 
     try:
         await shutdown_event.wait()
@@ -819,11 +864,47 @@ async def run_bot() -> None:
 
 
 def main() -> None:
-    """Run the asynchronous bot lifecycle."""
-    try:
-        asyncio.run(run_bot())
-    except KeyboardInterrupt:
-        log.info("Bot interrupted by keyboard")
+    """Run the asynchronous bot lifecycle, self-healing after fatal errors.
+
+    Transient network loss or a Telegram outage previously killed the
+    process permanently (Railway then sat idle until manually restarted).
+    Now the lifecycle is retried indefinitely with a capped backoff so the
+    bot recovers on its own. A Telegram 'Conflict' (two instances polling
+    with the same token) is retried on a longer delay because it usually
+    means the old container has not fully terminated yet.
+    """
+    delay = 10
+    while True:
+        wait = delay
+        try:
+            asyncio.run(run_bot())
+            log.info("Bot lifecycle ended cleanly")
+            return
+        except KeyboardInterrupt:
+            log.info("Bot interrupted by keyboard")
+            return
+        except TelegramError as exc:
+            if "Conflict" in str(exc):
+                # Another instance is polling with this token (e.g. the
+                # previous Railway container has not terminated yet).
+                wait = 60
+                log.error(
+                    f"Telegram Conflict (another instance polling?): {exc!r}; "
+                    f"retrying in {wait}s"
+                )
+            else:
+                log.error(
+                    f"Telegram error ended the bot lifecycle: {exc!r}; "
+                    f"restarting in {wait}s"
+                )
+        except Exception:
+            log.exception(
+                f"Unexpected fatal error ended the bot lifecycle; "
+                f"restarting in {wait}s"
+            )
+        time.sleep(wait)
+        delay = min(max(delay * 2, 10), 300)
+        wait = min(wait, delay)
 
 
 if __name__ == "__main__":

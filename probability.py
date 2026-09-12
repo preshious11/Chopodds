@@ -14,12 +14,12 @@ by the API but computable from available odds:
 from collections import defaultdict
 
 
-def decimal_to_implied(odds):
+def decimal_to_implied(odds: float) -> float:
     """Raw implied probability from a single decimal price. e.g. 1.50 -> 0.667"""
     return 1.0 / odds
 
 
-def devig_outcomes(raw_probs):
+def devig_outcomes(raw_probs: dict[str, float]) -> dict[str, float]:
     """
     Given raw implied probabilities for all outcomes in one market from one bookmaker,
     normalize them so they sum to 1.0 (removes the vig).
@@ -31,7 +31,7 @@ def devig_outcomes(raw_probs):
     return {name: p / total for name, p in raw_probs.items()}
 
 
-def consensus_probabilities(event, market="h2h"):
+def consensus_probabilities(event: dict, market: str = "h2h") -> dict[str, dict]:
     """
     Given one event from the Odds API response, compute the de-vigged
     probability for each outcome, averaged across every bookmaker offering it.
@@ -40,7 +40,7 @@ def consensus_probabilities(event, market="h2h"):
         outcome_name: {"probability": float, "num_bookmakers": int}
     }
     """
-    outcome_probs = defaultdict(list)
+    outcome_probs: dict[str, list[float]] = defaultdict(list)
 
     # Pre-filter bookmakers that have the target market to avoid nested loops
     for bookmaker in event.get("bookmakers", []):
@@ -61,7 +61,7 @@ def consensus_probabilities(event, market="h2h"):
     }
 
 
-def calculate_double_chance_probabilities(event):
+def calculate_double_chance_probabilities(event: dict) -> dict[str, dict]:
     """
     Calculate Double Chance probabilities from h2h market.
     Double Chance combines two of the three outcomes, giving higher probability.
@@ -118,7 +118,7 @@ def calculate_double_chance_probabilities(event):
     }
 
 
-def calculate_btts_probabilities(event):
+def calculate_btts_probabilities(event: dict) -> dict[str, dict]:
     """
     Calculate Both Teams to Score probabilities from the totals market.
     Uses Over/Under 2.5 goals as a proxy:

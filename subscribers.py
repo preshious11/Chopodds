@@ -12,7 +12,19 @@ _lock = Lock()
 SUBSCRIBERS_FILE = Path(__file__).resolve().parent / "subscribers.json"
 
 # Bot launch date - used as baseline for all stats
-BOT_LAUNCH_DATE = datetime(2026, 9, 10, 0, 0, 0, tzinfo=timezone.utc)
+# Can be overridden via BOT_LAUNCH_DATE env var (ISO format: YYYY-MM-DDTHH:MM:SS)
+import os
+from datetime import datetime, timezone
+_launch_date_str = os.environ.get("BOT_LAUNCH_DATE")
+if _launch_date_str:
+    try:
+        BOT_LAUNCH_DATE = datetime.fromisoformat(_launch_date_str)
+        if BOT_LAUNCH_DATE.tzinfo is None:
+            BOT_LAUNCH_DATE = BOT_LAUNCH_DATE.replace(tzinfo=timezone.utc)
+    except (ValueError, TypeError):
+        BOT_LAUNCH_DATE = datetime(2026, 9, 10, 0, 0, 0, tzinfo=timezone.utc)
+else:
+    BOT_LAUNCH_DATE = datetime(2026, 9, 10, 0, 0, 0, tzinfo=timezone.utc)
 
 
 def _load_subscribers() -> dict:

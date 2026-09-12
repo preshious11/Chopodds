@@ -21,6 +21,11 @@ logger = logging.getLogger(__name__)
 
 LAGOS_TZ = ZoneInfo("Africa/Lagos")
 
+# Diagnostic stats from the last generate_daily_predictions() run.
+# Exposed so the admin /status and /force_refresh_cache commands can report
+# exactly where matches were lost (fetch -> today filter -> consensus -> threshold).
+_last_generation_stats: dict = {}
+
 # Confidence tier thresholds
 CONFIDENCE_HIGH = 0.70      # >= 70%: High Confidence
 CONFIDENCE_MODERATE = 0.50  # 50-69%: Moderate Confidence
@@ -112,7 +117,15 @@ def get_confidence_tier(probability: float) -> str:
         return "Below Threshold"
 
 
-def _format_pick_description(market_type, outcome_name, point, home_team, away_team, probability, sport_name=None):
+def _format_pick_description(
+    market_type: str,
+    outcome_name: str,
+    point: float | None,
+    home_team: str,
+    away_team: str,
+    probability: float,
+    sport_name: str | None = None,
+) -> str | None:
     """
     Format a clear, actionable pick description using the exact line from the Odds API.
 
@@ -182,7 +195,11 @@ def _format_pick_description(market_type, outcome_name, point, home_team, away_t
     return outcome_name
 
 
-def _find_outcome_point(bookmakers, market_type, outcome_name):
+def _find_outcome_point(
+    bookmakers: list[dict],
+    market_type: str,
+    outcome_name: str,
+) -> float | None:
     """
     Find the point/line value for a specific outcome from the API data.
     Returns the point value or None if not found.
@@ -210,7 +227,7 @@ def _match_key(event: dict) -> str:
     return f"{home}|{away}|{commence}"
 
 
-def dedupe_by_match(predictions: list) -> list:
+def dedupe_by_match(predictions: list[dict]) -> list[dict]:
     """
     Keep only the strongest prediction per match.
     Groups by the API event id stored in 'event_id' (falls back to the
@@ -241,7 +258,10 @@ def dedupe_by_match(predictions: list) -> list:
     return [best_by_match[key] for key in order]
 
 
-def generate_daily_predictions(seed_date: date = None, max_predictions: int = None) -> list:
+def generate_daily_predictions(
+    seed_date: date | None = None,
+    max_predictions: int | None = None,
+) -> list[dict]:
     """
     Generate real daily predictions from The Odds API.
 
@@ -264,6 +284,10 @@ def generate_daily_predictions(seed_date: date = None, max_predictions: int = No
     all_candidates = []
     errors = []
     seen_match_keys = set()
+    raw_events_seen = 0
+    events_today = 0
+    events_no_bookmakers = 0
+    per_sport_events: dict[str, int] = {}
     for sport_name, leagues in SPORT_KEY_MAP.items():
         for league in leagues:
             sport_key = league["key"]
@@ -273,6 +297,7 @@ def generate_daily_predictions(seed_date: date = None, max_predictions: int = No
                 odds_data = get_odds(sport_key, markets="h2h,spreads,totals")
 
                 for event in odds_data:
+                    raw_events_seen += 1
                     commence_time_str = event.get("commence_time", "")
                     if not commence_time_str:
                         continue
@@ -291,6 +316,11 @@ def generate_daily_predictions(seed_date: date = None, max_predictions: int = No
                     except (ValueError, TypeError):
                         continue
 
+                    events_today += 1
+                    per_sport_events[sport_key] = (
+                        per_sport_events.get(sport_key, 0) + 1
+                    )
+
                     # Group by match — each match processed once
                     match_key = _match_key(event)
                     if match_key in seen_match_keys:
@@ -302,6 +332,7 @@ def generate_daily_predictions(seed_date: date = None, max_predictions: int = No
 
                     bookmakers = event.get("bookmakers", [])
                     if not bookmakers:
+                        events_no_bookmakers += 1
                         continue
 
                     # Evaluate all markets for this match and find the best
@@ -343,15 +374,73 @@ def generate_daily_predictions(seed_date: date = None, max_predictions: int = No
     predictions = dedupe_by_match(predictions)
     predictions.sort(key=lambda x: x["confidence"], reverse=True)
 
+    # Diagnostic summary — makes it possible to see exactly where matches
+    # were lost when investigating "no predictions available" on Railway.
+    before_threshold = len(all_candidates)
+    _last_generation_stats.clear()
+    _last_generation_stats.update({
+        "date": today.isoformat(),
+        "raw_events": raw_events_seen,
+        "events_today": events_today,
+        "events_no_bookmakers": events_no_bookmakers,
+        "candidates": before_threshold,
+        "returned": len(predictions),
+        "errors": len(errors),
+        "error_details": errors[:10],
+        "per_sport_events": dict(sorted(per_sport_events.items())),
+        "fallback_applied": before_threshold < config.MIN_MATCHES_FOR_FULL_QUALITY,
+    })
+    if before_threshold == 0:
+        if events_today == 0:
+            reason = (
+                f"0 matches kick off today ({today}, Africa/Lagos) — raw "
+                f"events: {raw_events_seen}. All matches are for other days."
+            )
+        elif raw_events_seen == 0:
+            reason = "API returned no events for any configured league."
+        else:
+            reason = (
+                f"{events_today} matches today but 0 passed market/consensus "
+                f"evaluation ({events_no_bookmakers} had no bookmakers; "
+                f"others lacked >= {config.MIN_BOOKMAKERS} bookmakers or "
+                f"odds >= {config.FALLBACK_PROBABILITY_FLOOR:.0%})."
+            )
+        _last_generation_stats["reason_zero"] = reason
+        logger.warning(
+            "Prediction generation produced 0 predictions. Reason: %s", reason,
+        )
+    logger.info(
+        "Prediction summary for %s: %d raw events fetched, %d events "
+        "kick off today (Lagos), %d candidates passed market/consensus "
+        "evaluation, %d passed the threshold/fallback filter "
+        "(capped at %d). %d league errors.",
+        today, raw_events_seen, events_today, len(all_candidates),
+        len(predictions), max_predictions, len(errors),
+    )
+
     if errors:
         logger.info(f"Prediction generation completed with {len(errors)} errors")
 
     return predictions[:max_predictions]
 
 
-def _evaluate_match_markets(event, bookmakers, sport_name, league,
-                            home_team, away_team, match_str, match_key,
-                            event_dt_lagos, today):
+def get_last_generation_stats() -> dict:
+    """Return diagnostic stats from the last generate_daily_predictions run."""
+    return dict(_last_generation_stats)
+
+
+def _evaluate_match_markets(
+    event: dict,
+    bookmakers: list[dict],
+    sport_name: str,
+    league: dict,
+    home_team: str,
+    away_team: str,
+    match_str: str,
+    match_key: str,
+    event_dt_lagos: datetime,
+    today: date,
+) -> dict | None:
     """Evaluate all markets for a single match, return best candidate."""
     best_candidate = None
     best_rank = None
@@ -395,9 +484,19 @@ def _evaluate_match_markets(event, bookmakers, sport_name, league,
     return best_candidate
 
 
-def _evaluate_market_outcomes(probs, bookmakers, market_type, sport_name, league,
-                              home_team, away_team, match_str, match_key,
-                              event_dt_lagos, today):
+def _evaluate_market_outcomes(
+    probs: dict[str, dict],
+    bookmakers: list[dict],
+    market_type: str,
+    sport_name: str,
+    league: dict,
+    home_team: str,
+    away_team: str,
+    match_str: str,
+    match_key: str,
+    event_dt_lagos: datetime,
+    today: date,
+) -> dict | None:
     """Evaluate all outcomes in a single market, return best candidate."""
     best_candidate = None
     best_rank = None
@@ -446,9 +545,18 @@ def _evaluate_market_outcomes(probs, bookmakers, market_type, sport_name, league
     return best_candidate
 
 
-def _evaluate_derived_outcomes(probs, market_type, sport_name, league,
-                               home_team, away_team, match_str, match_key,
-                               event_dt_lagos, today):
+def _evaluate_derived_outcomes(
+    probs: dict[str, dict],
+    market_type: str,
+    sport_name: str,
+    league: dict,
+    home_team: str,
+    away_team: str,
+    match_str: str,
+    match_key: str,
+    event_dt_lagos: datetime,
+    today: date,
+) -> dict | None:
     """Evaluate outcomes for a derived market (double_chance or btts)."""
     best_candidate = None
     best_rank = None
@@ -500,17 +608,17 @@ def _apply_threshold_with_fallback(candidates, min_threshold, fallback_floor, mi
     return fallback
 
 
-def get_top_picks(predictions: list, count: int = 5) -> list:
+def get_top_picks(predictions: list[dict], count: int = 5) -> list[dict]:
     """Return the top N highest-confidence picks."""
     return predictions[:count]
 
 
-def filter_by_sport(predictions: list, sport: str) -> list:
+def filter_by_sport(predictions: list[dict], sport: str) -> list[dict]:
     """Filter predictions by sport name."""
     return [p for p in predictions if p["sport"].lower() == sport.lower()]
 
 
-def get_available_sports(predictions: list) -> dict:
+def get_available_sports(predictions: list[dict]) -> dict[str, str]:
     """Get available sports from predictions."""
     sports = {}
     for pred in predictions:

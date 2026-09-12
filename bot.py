@@ -26,12 +26,15 @@ from telegram.error import BadRequest, TelegramError
 import config
 from daily_cache import (
     CACHE_DIR,
+    clear_today_cache,
     ensure_populated,
     get_cached_odds,
     get_lagos_date_str,
     validate_daily_cache,
 )
 from odds_client import _fetch_all_sports_odds
+import odds_client
+import predictions
 from settlement import settle_pending_predictions
 import tracking
 from predictions import generate_daily_predictions, get_top_picks, filter_by_sport
@@ -40,7 +43,7 @@ from subscribers import (
     get_all_chat_ids,
     get_subscriber_join_date,
 )
-from stats import format_stats_message, record_prediction_delivery
+from stats import format_stats_message
 from formatters import (
     format_top_picks,
     format_all_picks_paginated,
@@ -117,10 +120,23 @@ async def get_today_predictions() -> list:
         # We are the first caller — generate predictions
         _is_generating = True
         try:
-            _cached_predictions = generate_daily_predictions(max_predictions=20)
-            tracking.record_predictions(_cached_predictions)
-            _cached_date = today_lagos
-            log.info(f"Generated {len(_cached_predictions)} predictions for {today_lagos} (Lagos)")
+            predictions = generate_daily_predictions(max_predictions=20)
+            if predictions:
+                tracking.record_predictions(predictions)
+                _cached_predictions = predictions
+                _cached_date = today_lagos
+                log.info(f"Generated {len(predictions)} predictions for {today_lagos} (Lagos)")
+            else:
+                # Do NOT cache an empty result for the whole day — leave the
+                # date un-set so the next request retries the fetch. This
+                # prevents a transient API failure from locking the bot into
+                # "no predictions available" until midnight.
+                _cached_predictions = None
+                log.warning(
+                    "Prediction generation returned 0 matches for %s (Lagos); "
+                    "result NOT cached — next request will retry.",
+                    today_lagos,
+                )
         except (
             ConnectionError,
             TimeoutError,
@@ -133,7 +149,7 @@ async def get_today_predictions() -> list:
             ZeroDivisionError,
         ) as e:
             log.error(f"Network error generating predictions: {e}")
-            _cached_predictions = []
+            _cached_predictions = None
         finally:
             _is_generating = False
 
@@ -418,6 +434,21 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cache_size = cache_path.stat().st_size if cache_exists else 0
     tracking_health = tracking.get_health_metrics()
 
+    # Odds API diagnostics
+    api_status = odds_client.check_api_key()
+    gen_stats = predictions.get_last_generation_stats()
+    api_key_display = (
+        "Configured" if api_status["configured"] else "❌ MISSING"
+    )
+    api_valid_display = (
+        "✅ Valid" if api_status["valid"] else f"❌ {api_status['error'] or 'Not verified'}"
+    )
+    remaining_display = (
+        api_status["remaining"]
+        if api_status["remaining"] is not None
+        else "unknown (no API call made yet)"
+    )
+
     message = (
         "🩺 <b>Bot Status</b>\n\n"
         f"<b>Overall:</b> {status}\n"
@@ -427,11 +458,137 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"<b>Cache size:</b> {cache_size:,} bytes\n"
         f"<b>Cached sports:</b> {cached_sports}\n"
         f"<b>Cached matches:</b> {cached_matches}\n"
+        "<b>— Odds API —</b>\n"
+        f"<b>API key:</b> {api_key_display}\n"
+        f"<b>API key check:</b> {api_valid_display}\n"
+        f"<b>Requests remaining:</b> {remaining_display}\n"
+        f"<b>Requests used:</b> {api_status['used'] or 'unknown'}\n"
+        "<b>— Last generation —</b>\n"
+    )
+    if gen_stats:
+        message += (
+            f"<b>Date:</b> {gen_stats.get('date', 'n/a')}\n"
+            f"<b>Raw matches from API:</b> {gen_stats.get('raw_events', 0)}\n"
+            f"<b>Kick off today (Lagos):</b> {gen_stats.get('events_today', 0)}\n"
+            f"<b>No bookmakers:</b> {gen_stats.get('events_no_bookmakers', 0)}\n"
+            f"<b>Passed consensus eval:</b> {gen_stats.get('candidates', 0)}\n"
+            f"<b>Final predictions:</b> {gen_stats.get('returned', 0)}\n"
+            f"<b>League errors:</b> {gen_stats.get('errors', 0)}\n"
+            f"<b>Fallback floor applied:</b> "
+            f"{'Yes' if gen_stats.get('fallback_applied') else 'No'}\n"
+        )
+        if gen_stats.get("reason_zero"):
+            message += f"<b>⚠️ Zero-prediction reason:</b> {escape(gen_stats['reason_zero'])}\n"
+        per_sport = gen_stats.get("per_sport_events") or {}
+        if per_sport:
+            sport_lines = "\n".join(
+                f"  {escape(k)}: {v}" for k, v in per_sport.items()
+            )
+            message += f"<b>Events today per league:</b>\n{sport_lines}\n"
+    else:
+        message += "<i>No generation run yet since last restart.</i>\n"
+    message += (
+        "<b>— Settlement —</b>\n"
         f"<b>Pending settlements:</b> {tracking_health['pending']}\n"
         f"<b>Settled predictions:</b> {tracking_health['settled']}\n"
         f"<b>Last score fetch:</b> {tracking_health['last_score_fetch']}"
     )
     await update.message.reply_text(message, parse_mode="HTML")
+
+
+def _is_admin(update: Update) -> bool:
+    """Check whether the command caller is the configured admin."""
+    user = update.effective_user
+    return (
+        user is not None
+        and config.ADMIN_CHAT_ID
+        and user.id == config.ADMIN_CHAT_ID
+    )
+
+
+async def force_refresh_cache(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Admin-only: clear today's odds cache and regenerate predictions
+    immediately. Useful for debugging on Railway without waiting for
+    the midnight (Lagos) cache rollover.
+    """
+    if not _is_admin(update):
+        await update.message.reply_text(
+            "⛔ This command is restricted to the bot administrator."
+        )
+        return
+
+    loading = await update.message.reply_text(
+        "🔄 Clearing today's cache and re-fetching odds from the API..."
+    )
+
+    # 1. Drop in-memory prediction cache so a fresh fetch is triggered
+    global _cached_predictions, _cached_date
+    _cached_predictions = None
+    _cached_date = None
+
+    # 2. Delete today's on-disk cache file
+    removed = clear_today_cache()
+    log.info("Admin force-refresh: cache file removed=%s", removed)
+
+    # 3. Force a fresh API fetch + prediction regeneration
+    try:
+        predictions = await get_today_predictions()
+    except Exception as e:  # noqa: BLE001 — report any failure to the admin
+        log.error(f"Force refresh failed: {e}")
+        await loading.edit_text(f"❌ Force refresh failed: {escape(str(e))}")
+        return
+
+    if predictions:
+        preview = "\n".join(
+            f"• {escape(p['match'])} — {escape(p['pick'])} "
+            f"({p['confidence']:.0%})"
+            for p in predictions[:5]
+        )
+        await loading.edit_text(
+            f"✅ Cache refreshed — {len(predictions)} predictions regenerated.\n\n"
+            f"<b>Top picks preview:</b>\n{preview}",
+            parse_mode="HTML",
+        )
+    else:
+        # Credits available but nothing generated — report the exact reason.
+        quota = odds_client.get_last_quota()
+        gen_stats = predictions.get_last_generation_stats()
+        reason = gen_stats.get(
+            "reason_zero", "no specific reason recorded — check bot logs"
+        )
+        api_note = ""
+        try:
+            api_status = odds_client.check_api_key()
+            if not api_status["valid"]:
+                api_note = (
+                    f"\n<b>⚠️ API key problem:</b> {escape(api_status['error'])}"
+                )
+            elif api_status["remaining"] is not None and int(
+                api_status["remaining"]
+            ) == 0:
+                api_note = (
+                    "\n<b>🔴 [CRITICAL] Odds API quota exhausted "
+                    "(0 requests remaining)</b>"
+                )
+            else:
+                api_note = (
+                    f"\n<b>API credits:</b> {api_status['remaining']} requests "
+                    "remaining — key is valid."
+                )
+        except Exception as e:  # noqa: BLE001
+            api_note = f"\n<b>API check failed:</b> {escape(str(e))}"
+
+        await loading.edit_text(
+            "⚠️ Cache cleared but 0 predictions generated.\n"
+            f"<b>Reason:</b> {escape(reason)}"
+            f"{api_note}\n\n"
+            f"<b>Generation stats:</b> raw={gen_stats.get('raw_events', 0)}, "
+            f"today={gen_stats.get('events_today', 0)}, "
+            f"consensus={gen_stats.get('candidates', 0)}, "
+            f"quota_remaining={quota.get('remaining', 'unknown')}",
+            parse_mode="HTML",
+        )
 
 
 # ============================================================================
@@ -615,28 +772,34 @@ async def run_bot() -> None:
     app.add_handler(CommandHandler("sports", sports_filter))
     app.add_handler(CommandHandler("stats", stats_command))
     app.add_handler(CommandHandler("status", status_command))
+    app.add_handler(CommandHandler("force_refresh_cache", force_refresh_cache))
 
     # Callback handler for inline buttons
     app.add_handler(CallbackQueryHandler(button_callback))
 
     # Schedule daily broadcast using PTB's JobQueue
     if app.job_queue:
-        # Parse broadcast time
+        # Parse broadcast time — interpreted in Africa/Lagos timezone
+        # explicitly, so container/host timezone (e.g. UTC on Railway) does
+        # not shift the daily delivery time.
         hour, minute = map(int, config.DAILY_BROADCAST_TIME.split(":"))
         from datetime import time as dt_time
 
         app.job_queue.run_daily(
             daily_broadcast,
-            time=dt_time(hour=hour, minute=minute),
+            time=dt_time(hour=hour, minute=minute, tzinfo=LAGOS_TZ),
             name="daily_broadcast",
         )
         app.job_queue.run_repeating(
             settlement_job,
-            interval=12 * 60 * 60,
-            first=60,
+            interval=24 * 60 * 60,
+            first=120,
             name="settle_pending_predictions",
         )
-        log.info(f"Daily broadcast scheduled at {config.DAILY_BROADCAST_TIME} UTC")
+        log.info(
+            f"Daily broadcast scheduled at {config.DAILY_BROADCAST_TIME} "
+            f"Africa/Lagos"
+        )
     else:
         log.warning("Job queue not available — daily broadcast disabled")
 

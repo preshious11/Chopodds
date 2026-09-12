@@ -42,7 +42,7 @@ def _confidence_tier_label(pred: dict) -> str:
     }.get(tier, tier or "Value")
 
 
-def format_single_prediction(pred: dict, index: int = None) -> str:
+def format_single_prediction(pred: dict, index: int | None = None) -> str:
     """Format one prediction with compact match, selection, and timing copy."""
     prefix = f"{index}. " if index else ""
     confidence_pct = int(pred["confidence"] * 100)
@@ -58,7 +58,7 @@ def format_single_prediction(pred: dict, index: int = None) -> str:
     return msg
 
 
-def format_top_picks(predictions: list, count: int = 5) -> str:
+def format_top_picks(predictions: list[dict], count: int = 5) -> str:
     """Format top picks as an HTML message — clean and professional."""
     today_str = _today_lagos_str()
     picks = predictions[:count]

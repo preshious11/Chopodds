@@ -131,6 +131,12 @@ def ensure_populated(fetch_fn) -> dict:
     Ensure the daily cache is populated. Thread-safe using double-checked
     locking pattern — only the first concurrent caller triggers the fetch.
 
+    IMPORTANT: an empty/failed fetch is NOT cached. If every sport returned
+    no data (e.g. invalid API key -> 401, rate limit -> 429, or network
+    outage), we return the empty result without persisting it so the very
+    next request retries the fetch instead of being locked out for the
+    whole day with "no predictions available".
+
     fetch_fn: callable that returns dict mapping sport_key -> odds_data
     Returns the cached sports data (dict of sport_key -> odds_data).
     """
@@ -147,15 +153,58 @@ def ensure_populated(fetch_fn) -> dict:
         # We are the first caller — fetch and populate
         logger.info("Populating daily odds cache (first request of the day)...")
         try:
-            sports_data = fetch_fn()
-            # Persist the completed attempt, including an empty result. Once
-            # today's file exists, it is authoritative until the next date.
-            set_cached_odds(sports_data or {})
+            sports_data = fetch_fn() or {}
+            total_events = sum(
+                len(events) if isinstance(events, list) else 0
+                for events in sports_data.values()
+            )
+            if not sports_data or total_events == 0:
+                # Do NOT cache an empty result — the next request will retry.
+                logger.warning(
+                    "Daily odds fetch returned NO data (%d sports, %d events); "
+                    "NOT caching empty result — next request will retry. "
+                    "Check ODDS_API_KEY validity (401) or rate limits (429).",
+                    len(sports_data), total_events,
+                )
+                return sports_data
+
+            cache_path = _get_cache_path()
+            set_cached_odds(sports_data)
+            logger.info(
+                "Daily cache populated: %d raw matches fetched across %d sports "
+                "-> cache file: %s",
+                total_events, len(sports_data), cache_path,
+            )
             return sports_data
         except (ConnectionError, TimeoutError, OSError) as e:
             logger.error(f"Failed to populate daily cache: {e}")
             # Return whatever we have (might be empty dict)
             return get_cached_odds()
+
+
+def clear_today_cache() -> bool:
+    """
+    Delete today's cache file (if present) so the next request triggers a
+    fresh fetch. Used by the admin /force_refresh_cache command.
+    Returns True if a file was removed.
+    """
+    cache_path = _get_cache_path()
+    removed = False
+    if cache_path.exists():
+        try:
+            cache_path.unlink()
+            removed = True
+            logger.info("Cleared today's cache file: %s", cache_path)
+        except OSError as e:
+            logger.error("Failed to clear cache file %s: %s", cache_path, e)
+    # Also clear quarantined/corrupt variants for today so they cannot linger
+    for stale in CACHE_DIR.glob(f"odds_{get_lagos_date_str()}*.json"):
+        try:
+            stale.unlink()
+            logger.info("Cleared stale cache artifact: %s", stale.name)
+        except OSError:
+            pass
+    return removed
 
 
 def cleanup_old_cache(keep_days: int = 30) -> None:

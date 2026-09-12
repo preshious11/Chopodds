@@ -7,6 +7,10 @@
 .daily_cache/
 prediction_tracking.db
 
+# Runtime data (subscriber list, stats) — never commit or deploy these
+subscribers.json
+stats.json
+
 # Python
 __pycache__/
 *.py[cod]
@@ -29,3 +33,4 @@ Thumbs.db
 
 # Logs
 *.log
+bot_activity.log*

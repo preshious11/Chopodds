@@ -23,11 +23,16 @@ if not ODDS_API_KEY:
     raise SystemExit("Set ODDS_API_KEY environment variable first.")
 
 # Odds API configuration
-ODDS_REGIONS = os.environ.get("ODDS_REGIONS", "uk,eu,us,au")
-# Query all supported markets. The API returns what's available per sport;
-# unsupported markets are silently ignored by the API.
-# Derived markets (double_chance, btts) are calculated from base markets in probability.py.
-ODDS_MARKETS = os.environ.get("ODDS_MARKETS", "h2h,spreads,totals,btts,double_chance,draw_no_bet")
+# CREDIT COST WARNING: The Odds API charges credits = #regions x #markets
+# per request. 14 leagues x 4 regions x 6 markets = 336 credits per daily
+# fetch — far above the free tier's 500/month. Keep both lists minimal.
+# btts/double_chance are derived locally (probability.py) and cost nothing.
+ODDS_REGIONS = os.environ.get("ODDS_REGIONS", "uk")
+# Query only base markets actually used. The API returns what's available
+# per sport; unsupported markets are silently ignored by the API.
+# Derived markets (double_chance, btts) are calculated from base markets
+# in probability.py — never request them from the API.
+ODDS_MARKETS = os.environ.get("ODDS_MARKETS", "h2h,spreads,totals")
 
 # Bot Configuration
 ADMIN_CHAT_ID = int(os.environ.get("ADMIN_CHAT_ID", "0").strip() or "0")
@@ -35,7 +40,7 @@ ADMIN_CHAT_ID = int(os.environ.get("ADMIN_CHAT_ID", "0").strip() or "0")
 # Number of top picks to show in /dailypick and daily broadcast (3-5 recommended)
 DAILY_PICK_COUNT = int(os.environ.get("DAILY_PICK_COUNT", "5"))
 
-# Daily broadcast time in 24-hour format (UTC)
+# Daily broadcast time in 24-hour format (Africa/Lagos timezone)
 DAILY_BROADCAST_TIME = os.environ.get("DAILY_BROADCAST_TIME", "09:00")
 
 # Prediction Quality Thresholds

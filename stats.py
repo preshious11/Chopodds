@@ -122,6 +122,6 @@ def format_stats_message(user_id: int, user_joined_at: datetime = None) -> str:
     return message + (
         f"• Active member since: <code>{joined}</code>\n"
         f"• Predictions generated for you: <code>{user_stats['generated']}</code>\n"
-        f"• Your predictions settled: <code>{user_stats['won']} / {user_stats['lost']}</code>\n"
+        f"• Your predictions settled: <code>{user_stats['wins']} / {user_stats['losses']}</code>\n"
         f"• Your win rate: <code>{user_stats['win_rate']}%</code>"
     )

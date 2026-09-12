@@ -98,6 +98,132 @@ def _get_market_unit(sport_name: str, market_type: str) -> str:
     return MARKET_UNITS.get((sport_name, market_type))
 
 
+# ---------------------------------------------------------------------------
+# Market category mapping (for market-diversity selection)
+# ---------------------------------------------------------------------------
+# Maps every market_type this project can produce (direct from the Odds API or
+# derived locally in probability.py) to a diversity category. Robust to naming
+# variants (h2h/moneyline/match_winner/1x2 all map to "1x2").
+_MARKET_CATEGORY_MAP = {
+    # 1X2 / Match Winner
+    "h2h": "1x2",
+    "moneyline": "1x2",
+    "match_winner": "1x2",
+    "1x2": "1x2",
+    # Over/Under Goals
+    "totals": "over_under",
+    "alternate_totals": "over_under",
+    "tennis_games": "over_under",
+    # BTTS (derived from totals)
+    "btts": "btts",
+    # Double Chance (derived from h2h)
+    "double_chance": "double_chance",
+    # Handicap / Asian Handicap
+    "spreads": "handicap",
+    "alternate_spreads": "handicap",
+    "handicap": "handicap",
+    "asian_handicap": "handicap",
+    # Draw No Bet
+    "draw_no_bet": "draw_no_bet",
+}
+
+MARKET_CATEGORY_LABELS = {
+    "double_chance": "Double Chance",
+    "over_under": "Over/Under",
+    "btts": "BTTS",
+    "1x2": "1X2",
+    "handicap": "Handicap",
+    "draw_no_bet": "Draw No Bet",
+    "other": "Other",
+}
+
+
+def get_market_category(market_type: str) -> str:
+    """Map a raw market type (Odds API key or derived market) to its diversity category."""
+    return _MARKET_CATEGORY_MAP.get(str(market_type).lower(), "other")
+
+
+def _ranking_score(prediction: dict) -> float:
+    """
+    Internal ranking score = probability * market diversity multiplier.
+
+    Used only to order/select predictions. The displayed probability
+    ("confidence") is never modified.
+    """
+    multiplier = config.MARKET_DIVERSITY_MULTIPLIERS.get(
+        get_market_category(prediction.get("market_type", "")), 1.0,
+    )
+    return prediction.get("confidence", 0.0) * multiplier
+
+
+def _select_diverse_predictions(
+    candidates: list[dict],
+    max_total: int,
+    min_probability: float | None = None,
+) -> list[dict]:
+    """
+    Build the final daily list with market diversity, in rounds.
+
+    Priorities (in order): probability threshold, one prediction per match,
+    market diversity, ranking score (probability * market multiplier).
+
+    Round 1: select the highest-ranked eligible prediction from each market
+             category that has candidates.
+    Rounds 2-3: fill remaining slots with the highest-ranked remaining
+             predictions, always respecting per-market limits, the total cap,
+             and one prediction per match.
+
+    Candidates below min_probability are never selected. The caller passes the
+    effective threshold so the existing low-volume fallback rule (down to
+    FALLBACK_PROBABILITY_FLOOR) keeps working on quiet days.
+
+    Never invents predictions: categories with few candidates simply
+    contribute few picks.
+    """
+    if min_probability is None:
+        min_probability = config.MIN_PROBABILITY
+    limits = config.MARKET_SELECTION_LIMITS
+    eligible = [
+        p for p in candidates if p.get("confidence", 0.0) >= min_probability
+    ]
+    ranked = sorted(
+        eligible,
+        key=lambda p: (
+            -_ranking_score(p),
+            -p.get("confidence", 0.0),
+            -p.get("num_bookmakers", 0),
+        ),
+    )
+    selected: list[dict] = []
+    selected_match_keys: set[str] = set()
+    category_counts: dict[str, int] = {}
+
+    def try_select(pred: dict, require_fresh_category: bool) -> None:
+        category = get_market_category(pred.get("market_type", ""))
+        match_key = pred.get("event_id") or pred.get("match")
+        if match_key in selected_match_keys:
+            return
+        if require_fresh_category and category_counts.get(category, 0) > 0:
+            return
+        if category_counts.get(category, 0) >= limits.get(category, limits.get("other", 2)):
+            return
+        selected.append(pred)
+        selected_match_keys.add(match_key)
+        category_counts[category] = category_counts.get(category, 0) + 1
+
+    # Round 1: one prediction per market category (best-ranked first).
+    for pred in ranked:
+        try_select(pred, require_fresh_category=True)
+        if len(selected) >= max_total:
+            return selected
+    # Rounds 2-3: fill remaining slots purely by ranking score.
+    for pred in ranked:
+        if len(selected) >= max_total:
+            break
+        try_select(pred, require_fresh_category=False)
+    return selected
+
+
 def get_confidence_tier(probability: float) -> str:
     """
     Tag a prediction with a confidence tier based on its probability.
@@ -269,11 +395,15 @@ def generate_daily_predictions(
     1. For each event, evaluate ALL available markets (direct + derived):
        - Direct: h2h, spreads, totals (from the API)
        - Derived: double_chance (from h2h), btts (from totals)
-    2. Select the single highest-probability prediction per match.
-    3. Apply quality threshold (default 50%).
-    4. If fewer than MIN_MATCHES_FOR_FULL_QUALITY meet the threshold,
-       apply fallback: include top-ranked matches down to FALLBACK_PROBABILITY_FLOOR (40%).
-    5. Tag each prediction with a confidence tier.
+    2. Apply quality threshold (default 50%); if fewer than
+       MIN_MATCHES_FOR_FULL_QUALITY meet the threshold, apply fallback:
+       include top-ranked matches down to FALLBACK_PROBABILITY_FLOOR (40%).
+    3. Market-diversity selection: rank candidates by
+       probability * market-diversity multiplier, then build the final list
+       in rounds so no single market (e.g. Double Chance) dominates,
+       respecting per-market limits, the total cap (default 20), and
+       one prediction per match.
+    4. Tag each prediction with a confidence tier.
 
     One prediction per match is strictly enforced.
     """
@@ -335,16 +465,17 @@ def generate_daily_predictions(
                         events_no_bookmakers += 1
                         continue
 
-                    # Evaluate all markets for this match and find the best
-                    best_candidate = _evaluate_match_markets(
+                    # Evaluate all markets for this match; the diverse
+                    # selection step later keeps at most one per match.
+                    match_candidates = _evaluate_match_markets(
                         event, bookmakers, sport_name, league,
                         home_team, away_team, match_str, match_key,
                         event_dt_lagos, today,
                     )
 
-                    if best_candidate is not None:
+                    if match_candidates:
                         seen_match_keys.add(match_key)
-                        all_candidates.append(best_candidate)
+                        all_candidates.extend(match_candidates)
 
             except OddsAPIError as e:
                 errors.append(f"{league_name}: {e}")
@@ -366,6 +497,21 @@ def generate_daily_predictions(
         min_threshold=config.MIN_PROBABILITY,
         fallback_floor=config.FALLBACK_PROBABILITY_FLOOR,
         min_matches=config.MIN_MATCHES_FOR_FULL_QUALITY,
+    )
+
+    # Market-diversity selection: rank by probability * market multiplier,
+    # then build the final list in rounds (one pick per market category
+    # first, then fill by ranking score) while respecting per-market limits,
+    # the total cap, and one prediction per match. The selection floor mirrors
+    # the threshold/fallback decision so the existing low-volume rule
+    # (down to FALLBACK_PROBABILITY_FLOOR) keeps working.
+    selection_floor = config.MIN_PROBABILITY
+    if sum(
+        1 for c in all_candidates if c["confidence"] >= config.MIN_PROBABILITY
+    ) < config.MIN_MATCHES_FOR_FULL_QUALITY:
+        selection_floor = config.FALLBACK_PROBABILITY_FLOOR
+    predictions = _select_diverse_predictions(
+        predictions, max_predictions, min_probability=selection_floor,
     )
 
     for pred in predictions:
@@ -440,10 +586,16 @@ def _evaluate_match_markets(
     match_key: str,
     event_dt_lagos: datetime,
     today: date,
-) -> dict | None:
-    """Evaluate all markets for a single match, return best candidate."""
-    best_candidate = None
-    best_rank = None
+) -> list[dict]:
+    """
+    Evaluate all markets for a single match.
+
+    Returns one best candidate per market type (direct markets from the API
+    plus derived double_chance/btts). The final per-match selection is made
+    later by _select_diverse_predictions, which enforces one prediction per
+    match and market diversity.
+    """
+    candidates: dict[str, dict] = {}
     market_keys = set()
     for bookmaker in bookmakers:
         for mkt in bookmaker.get("markets", []):
@@ -456,10 +608,7 @@ def _evaluate_match_markets(
             probs, bookmakers, mkt_type, sport_name, league,
             home_team, away_team, match_str, match_key, event_dt_lagos, today)
         if candidate is not None:
-            rank = (candidate["confidence"], candidate["num_bookmakers"], candidate["odds"])
-            if best_rank is None or rank > best_rank:
-                best_rank = rank
-                best_candidate = candidate
+            candidates[mkt_type] = candidate
     if sport_name == "Football":
         dc_probs = calculate_double_chance_probabilities(event)
         if dc_probs:
@@ -467,21 +616,15 @@ def _evaluate_match_markets(
                 dc_probs, "double_chance", sport_name, league,
                 home_team, away_team, match_str, match_key, event_dt_lagos, today)
             if candidate is not None:
-                rank = (candidate["confidence"], candidate["num_bookmakers"], candidate["odds"])
-                if best_rank is None or rank > best_rank:
-                    best_rank = rank
-                    best_candidate = candidate
+                candidates["double_chance"] = candidate
         btts_probs = calculate_btts_probabilities(event)
         if btts_probs:
             candidate = _evaluate_derived_outcomes(
                 btts_probs, "btts", sport_name, league,
                 home_team, away_team, match_str, match_key, event_dt_lagos, today)
             if candidate is not None:
-                rank = (candidate["confidence"], candidate["num_bookmakers"], candidate["odds"])
-                if best_rank is None or rank > best_rank:
-                    best_rank = rank
-                    best_candidate = candidate
-    return best_candidate
+                candidates["btts"] = candidate
+    return list(candidates.values())
 
 
 def _evaluate_market_outcomes(

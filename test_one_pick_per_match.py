@@ -467,7 +467,15 @@ class RealCacheIntegrationTests(unittest.TestCase):
             matches = [p["match"] for p in filtered]
             self.assertEqual(len(matches), len(set(matches)), f"duplicates within {sport}")
 
-    def test_each_pick_is_the_strongest_market_for_its_match(self):
+    def test_each_pick_is_strongest_within_its_market(self):
+        """Each pick is the strongest candidate of its own market for the match.
+
+        Market diversity selection may pick a non-Double-Chance market for a
+        match (or drop a match once DC is capped), so the old "strongest
+        market overall" oracle no longer holds. The invariant that must hold:
+        whichever market was chosen for a match, the pick is the best outcome
+        within that market.
+        """
         events_by_key = {}
         for sport_key, events in self.cache.items():
             for event in events:
@@ -475,19 +483,27 @@ class RealCacheIntegrationTests(unittest.TestCase):
         for pred in self.predictions:
             event = events_by_key.get(pred["event_id"])
             self.assertIsNotNone(event, f"no cached event for {pred['match']}")
-            expected = expected_best_rank(event)
+            expected = expected_best_rank(event, only_market_type=pred["market_type"])
             actual = (pred["confidence"], pred["num_bookmakers"], pred["odds"])
             self.assertEqual(
                 actual, expected,
-                f"{pred['match']}: kept {actual}, expected strongest {expected}"
+                f"{pred['match']}: kept {actual}, expected strongest "
+                f"{pred['market_type']} candidate {expected}"
             )
 
+    def test_diverse_selection_respects_market_caps(self):
+        """Real cache: Double Chance never exceeds its cap, total never exceeds 20."""
+        dc = [p for p in self.predictions if p["market_type"] == "double_chance"]
+        self.assertLessEqual(len(dc), config.MAX_DOUBLE_CHANCE)
+        self.assertLessEqual(len(self.predictions), config.MAX_TOTAL_PREDICTIONS)
 
-def expected_best_rank(event):
+
+def expected_best_rank(event, only_market_type=None):
     """Recompute the strongest candidate rank for an event (test oracle).
 
     Evaluates both direct markets (h2h, spreads, totals) and derived markets
-    (double_chance, btts) to find the single strongest prediction.
+    (double_chance, btts) to find the single strongest prediction. If
+    only_market_type is given, restricts the oracle to that market only.
     """
     best = None
     bookmakers = event.get("bookmakers", [])
@@ -504,6 +520,8 @@ def expected_best_rank(event):
                 market_keys.add(key)
 
     for market_type in market_keys:
+        if only_market_type and market_type != only_market_type:
+            continue
         for outcome_name, data in consensus_probabilities(event, market=market_type).items():
             if data["num_bookmakers"] < 3:
                 continue
@@ -536,7 +554,10 @@ def expected_best_rank(event):
 
     # Evaluate derived markets (double_chance, btts)
     # Double Chance
-    dc_probs = predictions.calculate_double_chance_probabilities(event)
+    dc_probs = (
+        predictions.calculate_double_chance_probabilities(event)
+        if only_market_type in (None, "double_chance") else {}
+    )
     for outcome_name, data in dc_probs.items():
         if data["num_bookmakers"] < 3:
             continue
@@ -552,7 +573,10 @@ def expected_best_rank(event):
             best = rank
 
     # BTTS
-    btts_probs = predictions.calculate_btts_probabilities(event)
+    btts_probs = (
+        predictions.calculate_btts_probabilities(event)
+        if only_market_type in (None, "btts") else {}
+    )
     for outcome_name, data in btts_probs.items():
         if data["num_bookmakers"] < 3:
             continue

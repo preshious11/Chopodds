@@ -15,6 +15,7 @@ from probability import (
     consensus_probabilities,
     calculate_double_chance_probabilities,
     calculate_btts_probabilities,
+    calculate_combined_odds,
 )
 
 logger = logging.getLogger(__name__)
@@ -141,6 +142,17 @@ MARKET_CATEGORY_LABELS = {
 def get_market_category(market_type: str) -> str:
     """Map a raw market type (Odds API key or derived market) to its diversity category."""
     return _MARKET_CATEGORY_MAP.get(str(market_type).lower(), "other")
+
+
+def _market_floor(market_type: str) -> float:
+    """
+    Minimum probability a candidate must clear for its market category
+    (config.MARKET_MIN_PROBABILITY_FLOORS). Unknown categories fall back to
+    the global MIN_PROBABILITY, i.e. no extra floor beyond the existing rule.
+    """
+    return config.MARKET_MIN_PROBABILITY_FLOORS.get(
+        get_market_category(market_type), config.MIN_PROBABILITY
+    )
 
 
 def _ranking_score(prediction: dict) -> float:
@@ -440,6 +452,11 @@ def generate_daily_predictions(
                         if event_dt.tzinfo is None:
                             event_dt = event_dt.replace(tzinfo=timezone.utc)
 
+                        # STRICT GUARD: Exclude matches that have already kicked off
+                        # or finished. Only future matches are eligible.
+                        if event_dt <= datetime.now(timezone.utc):
+                            continue
+
                         event_dt_lagos = event_dt.astimezone(LAGOS_TZ)
                         if event_dt_lagos.date() != today:
                             continue
@@ -492,8 +509,29 @@ def generate_daily_predictions(
                 errors.append(f"{league_name}: {e}")
                 logger.error(f"Invalid odds data for {league_name}: {e}")
 
+    # Per-market probability floors (config.MARKET_MIN_PROBABILITY_FLOORS):
+    # on the standard path a candidate must clear its own market category's
+    # floor BEFORE it is eligible for the threshold/diversity selection below.
+    # This stops a weak pick in a naturally-high-scoring market (e.g. Double
+    # Chance) from slipping through just because that market's consensus
+    # probabilities run high on average. The low-volume fallback rule (down to
+    # FALLBACK_PROBABILITY_FLOOR) is deliberately untouched so quiet days
+    # still surface picks.
+    qualifying_count = sum(
+        1 for c in all_candidates if c["confidence"] >= config.MIN_PROBABILITY
+    )
+    low_volume_day = (
+        qualifying_count < config.MIN_MATCHES_FOR_FULL_QUALITY
+    )
+    threshold_candidates = all_candidates
+    if not low_volume_day:
+        threshold_candidates = [
+            c for c in all_candidates
+            if c["confidence"] >= _market_floor(c["market_type"])
+        ]
+
     predictions = _apply_threshold_with_fallback(
-        all_candidates,
+        threshold_candidates,
         min_threshold=config.MIN_PROBABILITY,
         fallback_floor=config.FALLBACK_PROBABILITY_FLOOR,
         min_matches=config.MIN_MATCHES_FOR_FULL_QUALITY,
@@ -505,11 +543,11 @@ def generate_daily_predictions(
     # the total cap, and one prediction per match. The selection floor mirrors
     # the threshold/fallback decision so the existing low-volume rule
     # (down to FALLBACK_PROBABILITY_FLOOR) keeps working.
-    selection_floor = config.MIN_PROBABILITY
-    if sum(
-        1 for c in all_candidates if c["confidence"] >= config.MIN_PROBABILITY
-    ) < config.MIN_MATCHES_FOR_FULL_QUALITY:
-        selection_floor = config.FALLBACK_PROBABILITY_FLOOR
+    selection_floor = (
+        config.FALLBACK_PROBABILITY_FLOOR
+        if low_volume_day
+        else config.MIN_PROBABILITY
+    )
     predictions = _select_diverse_predictions(
         predictions, max_predictions, min_probability=selection_floor,
     )
@@ -751,21 +789,412 @@ def _apply_threshold_with_fallback(candidates, min_threshold, fallback_floor, mi
     return fallback
 
 
+def _match_pick_key(pred: dict) -> tuple[str, str]:
+    """Build a (match, pick) tuple used as a unique identity for a selection."""
+    return (pred.get("match", ""), pred.get("pick", ""))
+
+
+def _odds_value(pred: dict) -> float:
+    """Safely extract a decimal odds float from a prediction dict."""
+    try:
+        return float(pred.get("odds", 1.0))
+    except (TypeError, ValueError):
+        return 1.0
+
+
+def _passes_market_variety(
+    pred: dict,
+    market_counts: dict[str, int],
+    limit: int = 2,
+) -> bool:
+    """True if adding ``pred`` would not exceed the per-market ``limit``."""
+    mt = pred.get("market_type", "other")
+    return market_counts.get(mt, 0) < limit
+
+
+def _build_exact_accumulator(
+    candidates: list[dict],
+    *,
+    target: float,
+    tolerance: float,
+    min_legs: int,
+    max_legs: int,
+    market_limit: int,
+    min_odds: float | None = None,
+    max_odds: float | None = None,
+    excluded: set[tuple[str, str]] | None = None,
+) -> list[dict]:
+    """Build an accumulator whose combined odds are as close to ``target`` as
+    possible while respecting market variety, leg count bounds, and an optional
+    ``[min_odds, max_odds]`` clamp.
+
+    For small ``max_legs`` (≤ 4) we use brute-force enumeration of all
+    combinations — this finds the exact best fit.  For larger ``max_legs`` we
+    fall back to a greedy best-fit with local-search refinement.
+    """
+    if excluded is None:
+        excluded = set()
+    if not candidates:
+        return []
+    if max_legs <= 4:
+        return _brute_force_accumulator(
+            candidates, target, tolerance, min_legs, max_legs,
+            market_limit, min_odds, max_odds, excluded,
+        )
+    return _greedy_exact_accumulator(
+        candidates, target, tolerance, min_legs, max_legs,
+        market_limit, min_odds, max_odds, excluded,
+    )
+
+
+def _brute_force_accumulator(
+    candidates: list[dict],
+    target: float,
+    tolerance: float,
+    min_legs: int,
+    max_legs: int,
+    market_limit: int,
+    min_odds: float | None,
+    max_odds: float | None,
+    excluded: set[tuple[str, str]],
+) -> list[dict]:
+    """Enumerate all combinations up to ``max_legs`` and return the one whose
+    combined odds are at or above ``target`` with minimal overshoot.
+
+    The hard floor (``min_odds``) is set to ``target`` by callers, so any
+    combination below the target is rejected.  Among the remaining candidates
+    we pick the one closest to the target — i.e. the smallest product that
+    is still >= target."""
+    from itertools import combinations
+
+    floor = min_odds if min_odds is not None else target
+    ceiling = max_odds if max_odds is not None else (target + tolerance)
+
+    best_combo: tuple[dict, ...] = ()
+    best_gap = float("inf")
+    best_below: tuple[dict, ...] = ()
+    best_below_product = 0.0
+
+    for size in range(1, max_legs + 1):
+        for combo in combinations(candidates, size):
+            keys = [_match_pick_key(p) for p in combo]
+            if any(k in excluded for k in keys):
+                continue
+            mkt_counts: dict[str, int] = {}
+            variety_ok = True
+            for p in combo:
+                mt = p.get("market_type", "other")
+                mkt_counts[mt] = mkt_counts.get(mt, 0) + 1
+                if mkt_counts[mt] > market_limit:
+                    variety_ok = False
+                    break
+            if not variety_ok:
+                continue
+            product = 1.0
+            for p in combo:
+                product *= _odds_value(p)
+            if product > ceiling:
+                continue
+            if product >= floor:
+                gap = product - target
+                if gap < best_gap:
+                    best_gap = gap
+                    best_combo = combo
+            elif product > best_below_product:
+                best_below_product = product
+                best_below = combo
+
+    if best_combo:
+        return list(best_combo)
+    # Fall back to the best product below the floor (never empty if candidates exist)
+    if best_below:
+        return list(best_below)
+    return []
+
+
+def _greedy_exact_accumulator(
+    candidates: list[dict],
+    target: float,
+    tolerance: float,
+    min_legs: int,
+    max_legs: int,
+    market_limit: int,
+    min_odds: float | None,
+    max_odds: float | None,
+    excluded: set[tuple[str, str]],
+) -> list[dict]:
+    """Greedy best-fit with local-search refinement for larger leg counts.
+
+    The algorithm keeps adding legs until the combined product reaches the
+    ``target`` (within ``tolerance``) or ``max_legs`` is reached.  Unlike a
+    simple greedy search, it does NOT stop at a local minimum — if the
+    product is still below ``min_odds`` it MUST keep adding, even when every
+    remaining candidate temporarily widens the gap."""
+    selected: list[dict] = []
+    market_counts: dict[str, int] = {}
+    used: set[tuple[str, str]] = set(excluded)
+    product = 1.0
+    pool = list(candidates)
+    floor = min_odds if min_odds is not None else target
+
+    while len(selected) < max_legs:
+        # Stop early only when we're inside the acceptance band.
+        if product >= target and (product - target) <= tolerance:
+            break
+
+        best_idx = None
+        best_gap = float("inf")
+
+        for idx, pred in enumerate(pool):
+            mp = _match_pick_key(pred)
+            if mp in used:
+                continue
+            if not _passes_market_variety(pred, market_counts, market_limit):
+                continue
+            new_product = product * _odds_value(pred)
+            if max_odds is not None and new_product > max_odds:
+                continue
+            # While we're below the floor, prefer the largest product that
+            # doesn't overshoot max_odds (gets us to the target fastest).
+            if product < floor:
+                gap = max_odds - new_product if max_odds is not None else -new_product
+            else:
+                gap = abs(new_product - target)
+            if gap < best_gap:
+                best_gap = gap
+                best_idx = idx
+
+        if best_idx is None:
+            break
+
+        chosen = pool[best_idx]
+        mp = _match_pick_key(chosen)
+        selected.append(chosen)
+        used.add(mp)
+        mt = chosen.get("market_type", "other")
+        market_counts[mt] = market_counts.get(mt, 0) + 1
+        product *= _odds_value(chosen)
+
+    # Local search: try swapping each selected pick with an unused candidate
+    improved = True
+    while improved and len(selected) > 0:
+        improved = False
+        current_gap = abs(product - target)
+        for i, sel in enumerate(selected):
+            sel_key = _match_pick_key(sel)
+            sel_odds = _odds_value(sel)
+            remaining_product = product / sel_odds
+            for pred in pool:
+                mp = _match_pick_key(pred)
+                if mp in used:
+                    continue
+                new_product = remaining_product * _odds_value(pred)
+                if max_odds is not None and new_product > max_odds:
+                    continue
+                new_mt = pred.get("market_type", "other")
+                old_mt = sel.get("market_type", "other")
+                if new_mt != old_mt:
+                    if market_counts.get(new_mt, 0) >= market_limit:
+                        continue
+                gap = abs(new_product - target)
+                if gap < current_gap - 0.001:
+                    used.discard(sel_key)
+                    used.add(mp)
+                    if new_mt != old_mt:
+                        market_counts[old_mt] = market_counts.get(old_mt, 1) - 1
+                        market_counts[new_mt] = market_counts.get(new_mt, 0) + 1
+                    selected[i] = pred
+                    product = new_product
+                    current_gap = gap
+                    improved = True
+                    break
+            if improved:
+                break
+
+    # Never return empty if we have candidates — always return the best effort
+    return selected
+
+
+def build_target_odds_accumulator(
+    predictions: list[dict],
+    min_probability: float = 0.75,
+    target_odds: float = 2.0,
+    max_legs: int = 4,
+    excluded_match_picks: set[tuple[str, str]] | None = None,
+) -> list[dict]:
+    """Backwards-compatible wrapper around ``_build_exact_accumulator``.
+
+    Retained for any external callers; ``get_top_picks`` / ``get_all_picks``
+    now use ``_build_exact_accumulator`` directly so the probability ceiling,
+    tolerance, and odds clamp can be set precisely.
+    """
+    if excluded_match_picks is None:
+        excluded_match_picks = set()
+    eligible = sorted(
+        [p for p in predictions if p.get("confidence", 0.0) >= min_probability],
+        key=lambda p: p.get("confidence", 0.0),
+        reverse=True,
+    )
+    return _build_exact_accumulator(
+        eligible,
+        target=target_odds,
+        tolerance=config.TOP_PICK_TOLERANCE,
+        min_legs=config.TOP_PICK_MIN_LEGS,
+        max_legs=max_legs,
+        market_limit=2,
+        excluded=excluded_match_picks,
+    )
+
+
 def get_top_picks(predictions: list[dict], count: int = 5) -> list[dict]:
-    """Return the top N highest-confidence picks."""
-    return predictions[:count]
+    """Return the top-picks accumulator with probability fallback cascade.
+
+    Probability tiers: 70-90% → 60-70% → 50-60%.
+    Combined odds target: exactly 2.00 (±config.TOP_PICK_TOLERANCE).
+    Legs: 2-3 (config.TOP_PICK_MIN/MAX_LEGS).
+
+    ``count`` is accepted for backward-compatibility but the accumulator
+    always uses the configured leg bounds.
+    """
+    from probability import filter_by_probability_bracket
+
+    tiers = config.TOP_PICK_PROBABILITY_TIERS
+    best_result: list[dict] = []
+
+    for tier_idx, (lo, hi) in enumerate(tiers):
+        tier_candidates = filter_by_probability_bracket(predictions, lo, hi)
+        # Combine all candidates from tiers tried so far (higher tiers first)
+        cumulative = []
+        seen_keys: set[tuple[str, str]] = set()
+        for t_lo, t_hi in tiers[: tier_idx + 1]:
+            for p in filter_by_probability_bracket(predictions, t_lo, t_hi):
+                key = _match_pick_key(p)
+                if key not in seen_keys:
+                    seen_keys.add(key)
+                    cumulative.append(p)
+
+        cumulative = sorted(
+            cumulative,
+            key=lambda p: p.get("confidence", 0.0),
+            reverse=True,
+        )[: config.ACCUMULATOR_MAX_CANDIDATES]
+
+        result = _build_exact_accumulator(
+            cumulative,
+            target=config.TOP_PICK_TARGET_ODDS,
+            tolerance=config.TOP_PICK_TOLERANCE,
+            min_legs=config.TOP_PICK_MIN_LEGS,
+            max_legs=config.TOP_PICK_MAX_LEGS,
+            market_limit=2,
+            min_odds=config.TOP_PICK_MIN_ODDS,
+            max_odds=config.TOP_PICK_TARGET_ODDS + config.TOP_PICK_TOLERANCE,
+        )
+
+        if result:
+            best_result = result
+            # Check if we hit the target within tolerance
+            product = 1.0
+            for p in result:
+                product *= _odds_value(p)
+            if abs(product - config.TOP_PICK_TARGET_ODDS) <= config.TOP_PICK_TOLERANCE:
+                return result  # Target hit — stop cascade
+
+    return best_result
+
+
+def get_all_picks(predictions: list[dict], top_picks: list[dict] | None = None) -> list[dict]:
+    """Return the all-picks accumulator with probability fallback cascade.
+
+    Probability tiers: 65-90% → 55-65% → 50-55%.
+    Combined odds target: 8.00-10.00 (config.ALL_PICK_MIN/MAX_ODDS).
+    Legs: 5-10 (config.ALL_PICK_MIN/MAX_LEGS).
+
+    Excludes exact match+pick pairings already used in ``top_picks``. If the
+    same fixture has a *different* outcome available, that outcome is eligible.
+    If no distinct outcome exists, the fixture is skipped entirely.
+    """
+    from probability import filter_by_probability_bracket
+
+    excluded: set[tuple[str, str]] = {
+        _match_pick_key(p) for p in (top_picks or [])
+    }
+
+    tiers = config.ALL_PICK_PROBABILITY_TIERS
+    best_result: list[dict] = []
+
+    for tier_idx, (lo, hi) in enumerate(tiers):
+        # Combine all candidates from tiers tried so far (higher tiers first)
+        cumulative: list[dict] = []
+        seen_keys: set[tuple[str, str]] = set()
+        for t_lo, t_hi in tiers[: tier_idx + 1]:
+            for p in filter_by_probability_bracket(predictions, t_lo, t_hi):
+                key = _match_pick_key(p)
+                if key not in seen_keys and key not in excluded:
+                    seen_keys.add(key)
+                    cumulative.append(p)
+
+        cumulative = sorted(
+            cumulative,
+            key=lambda p: p.get("confidence", 0.0),
+            reverse=True,
+        )[: config.ACCUMULATOR_MAX_CANDIDATES]
+
+        result = _build_exact_accumulator(
+            cumulative,
+            target=config.ALL_PICK_TARGET_ODDS,
+            tolerance=config.ALL_PICK_TOLERANCE,
+            min_legs=config.ALL_PICK_MIN_LEGS,
+            max_legs=config.ALL_PICK_MAX_LEGS,
+            market_limit=2,
+            min_odds=config.ALL_PICK_MIN_ODDS,
+            max_odds=config.ALL_PICK_MAX_ODDS,
+            excluded=excluded,
+        )
+
+        if result:
+            best_result = result
+            product = 1.0
+            for p in result:
+                product *= _odds_value(p)
+            if config.ALL_PICK_MIN_ODDS <= product <= config.ALL_PICK_MAX_ODDS:
+                return result  # Target hit — stop cascade
+
+    return best_result
+
+
+def calculate_ticket_odds(picks: list[dict]) -> float:
+    """
+    Combined odds for a multi-pick daily ticket (accumulator).
+
+    Total Odds = Odds_1 * Odds_2 * ... * Odds_N — the mathematical product of
+    each selection's decimal odds, never their sum.
+    """
+    return calculate_combined_odds([p.get("odds") for p in picks])
+
+
+def build_accumulator(picks: list[dict]) -> dict:
+    """
+    Build a multi-pick daily ticket summary.
+
+    Returns the individual selections (each with its own decimal odds) plus
+    the calculated combined ticket total, so callers can display both.
+    """
+    selections = [
+        {
+            "match": p.get("match"),
+            "pick": p.get("pick"),
+            "odds": p.get("odds"),
+            "confidence": p.get("confidence"),
+        }
+        for p in picks
+    ]
+    return {
+        "num_selections": len(picks),
+        "selections": selections,
+        "combined_odds": calculate_ticket_odds(picks),
+    }
 
 
 def filter_by_sport(predictions: list[dict], sport: str) -> list[dict]:
     """Filter predictions by sport name."""
     return [p for p in predictions if p["sport"].lower() == sport.lower()]
-
-
-def get_available_sports(predictions: list[dict]) -> dict[str, str]:
-    """Get available sports from predictions."""
-    sports = {}
-    for pred in predictions:
-        sport = pred["sport"]
-        if sport not in sports:
-            sports[sport] = pred["sport_icon"]
-    return sports

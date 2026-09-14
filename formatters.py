@@ -9,6 +9,8 @@ from datetime import datetime
 
 from zoneinfo import ZoneInfo
 
+from probability import calculate_combined_odds
+
 LAGOS_TZ = ZoneInfo("Africa/Lagos")
 
 
@@ -65,13 +67,13 @@ def format_top_picks(predictions: list[dict], count: int = 5) -> str:
 
     msg = f"🏆 <b>Top Picks for {today_str}</b>\n\n"
 
-    total_odds = 0
+    # Combined accumulator odds = product of the individual decimal odds
+    total_odds = calculate_combined_odds([pred['odds'] for pred in picks])
     for i, pred in enumerate(picks, 1):
         msg += format_single_prediction(pred, i)
         msg += "\n"
-        total_odds += pred['odds']
 
-    msg += f"<i>Combined Odds: <b>{total_odds:.2f}</b></i>"
+    msg += f"<i>Combined Odds (Accumulator, {len(picks)} picks): <b>{total_odds:.2f}</b></i>"
 
     return msg
 
@@ -98,9 +100,9 @@ def format_all_picks_paginated(predictions: list, page: int = 1, per_page: int =
         msg += format_single_prediction(pred, i)
         msg += "\n"
 
-    # Add combined odds for ALL predictions (not just current page)
-    total_odds = sum(p['odds'] for p in predictions)
-    msg += f"<i>Combined Odds (All {len(predictions)} picks): <b>{total_odds:.2f}</b></i>"
+    # Combined accumulator odds over ALL predictions (product, not sum)
+    total_odds = calculate_combined_odds([p['odds'] for p in predictions])
+    msg += f"<i>Combined Odds (Accumulator, All {len(predictions)} picks): <b>{total_odds:.2f}</b></i>"
 
     return msg, total_pages
 

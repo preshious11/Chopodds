@@ -61,6 +61,29 @@ def consensus_probabilities(event: dict, market: str = "h2h") -> dict[str, dict]
     }
 
 
+def calculate_combined_odds(odds_values) -> float:
+    """
+    Calculate combined accumulator (parlay/multi-pick) odds.
+
+    Total Odds = Odds_1 * Odds_2 * ... * Odds_N  (product of decimal odds).
+
+    Non-numeric values and non-positive prices are skipped (a decimal price
+    is always > 1.0). Returns 0.0 when no valid odds are supplied.
+    """
+    product = 1.0
+    valid = 0
+    for value in odds_values:
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            continue
+        if value <= 1.0:
+            continue
+        product *= value
+        valid += 1
+    return round(product, 2) if valid else 0.0
+
+
 def calculate_double_chance_probabilities(event: dict) -> dict[str, dict]:
     """
     Calculate Double Chance probabilities from h2h market.
@@ -163,3 +186,17 @@ def calculate_btts_probabilities(event: dict) -> dict[str, dict]:
             "num_bookmakers": num_bookmakers,
         },
     }
+
+
+def is_probability_in_bracket(probability: float, min_p: float, max_p: float) -> bool:
+    """Return True when ``probability`` falls within the inclusive bracket."""
+    return min_p <= probability <= max_p
+
+
+def filter_by_probability_bracket(
+    candidates: list[dict],
+    min_p: float,
+    max_p: float,
+) -> list[dict]:
+    """Keep only candidates whose confidence falls within ``[min_p, max_p]``."""
+    return [c for c in candidates if min_p <= c.get("confidence", 0.0) <= max_p]

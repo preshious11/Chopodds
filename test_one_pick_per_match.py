@@ -13,7 +13,7 @@ Run: python -m pytest test_one_pick_per_match.py -v
 
 import copy
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from unittest import mock
 from zoneinfo import ZoneInfo
 
@@ -25,6 +25,7 @@ from predictions import (
     filter_by_sport,
     generate_daily_predictions,
     get_top_picks,
+    get_all_picks,
     _format_pick_description,
 )
 from probability import consensus_probabilities
@@ -43,11 +44,18 @@ def _no_network(*args, **kwargs):
 
 
 def _today_kickoff_utc(hour=15):
-    """ISO-8601 UTC kickoff that always falls on today's Lagos date."""
-    lagos_today = datetime.now(LAGOS_TZ).replace(
-        hour=hour, minute=0, second=0, microsecond=0
-    )
-    return lagos_today.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    """Future kickoff (UTC ISO) that still falls on today's Lagos date."""
+    now_utc = datetime.now(timezone.utc)
+    lagos_now = now_utc.astimezone(LAGOS_TZ)
+    candidate = lagos_now.replace(hour=hour, minute=0, second=0, microsecond=0)
+    if candidate <= lagos_now:
+        # Fixed slot already passed — use a near-future time so the
+        # strict future-only commence guard doesn't drop the event.
+        candidate = lagos_now + timedelta(minutes=15)
+        if candidate.date() != lagos_now.date():
+            # Within minutes of Lagos midnight: just step 30 seconds ahead.
+            candidate = lagos_now + timedelta(seconds=30)
+    return candidate.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _out(name, price, point=None):
@@ -439,10 +447,15 @@ class RealCacheIntegrationTests(unittest.TestCase):
 
     def test_top_picks_and_view_all_never_repeat_match(self):
         preds = self.predictions
-        top = get_top_picks(preds, count=5)
-        top_matches = {p["match"] for p in top}
-        rest = preds[len(top):]
-        self.assertTrue(top_matches.isdisjoint(p["match"] for p in rest))
+        top = get_top_picks(preds)
+        all_picks = get_all_picks(preds, top)
+        # No exact match+pick pairing appears in both outputs
+        top_keys = {(p["match"], p["pick"]) for p in top}
+        all_keys = {(p["match"], p["pick"]) for p in all_picks}
+        self.assertTrue(top_keys.isdisjoint(all_keys))
+        # No match appears more than once within each output
+        self.assertEqual(len({p["match"] for p in top}), len(top))
+        self.assertEqual(len({p["match"] for p in all_picks}), len(all_picks))
 
     def test_pagination_never_repeats_a_match(self):
         preds = self.predictions

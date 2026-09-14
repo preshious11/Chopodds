@@ -14,7 +14,7 @@ Run: python -m pytest test_market_diversity.py -v
 """
 
 import unittest
-from datetime import datetime
+from datetime import datetime, timedelta
 from unittest import mock
 
 import config
@@ -73,10 +73,15 @@ def _out(name, price, point=None):
 
 
 def _today_kickoff_utc(hour=15):
-    lagos_today = datetime.now(predictions.LAGOS_TZ).replace(
-        hour=hour, minute=0, second=0, microsecond=0
-    )
-    return lagos_today.astimezone(predictions.timezone.utc).strftime(
+    """Future kickoff (UTC ISO) that still falls on today's Lagos date."""
+    now_utc = datetime.now(predictions.timezone.utc)
+    lagos_now = now_utc.astimezone(predictions.LAGOS_TZ)
+    candidate = lagos_now.replace(hour=hour, minute=0, second=0, microsecond=0)
+    if candidate <= lagos_now:
+        candidate = lagos_now + timedelta(minutes=15)
+        if candidate.date() != lagos_now.date():
+            candidate = lagos_now + timedelta(seconds=30)
+    return candidate.astimezone(predictions.timezone.utc).strftime(
         "%Y-%m-%dT%H:%M:%SZ"
     )
 

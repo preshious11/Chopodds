@@ -11,21 +11,6 @@ _lock = Lock()
 
 SUBSCRIBERS_FILE = Path(__file__).resolve().parent / "subscribers.json"
 
-# Bot launch date - used as baseline for all stats
-# Can be overridden via BOT_LAUNCH_DATE env var (ISO format: YYYY-MM-DDTHH:MM:SS)
-import os
-from datetime import datetime, timezone
-_launch_date_str = os.environ.get("BOT_LAUNCH_DATE")
-if _launch_date_str:
-    try:
-        BOT_LAUNCH_DATE = datetime.fromisoformat(_launch_date_str)
-        if BOT_LAUNCH_DATE.tzinfo is None:
-            BOT_LAUNCH_DATE = BOT_LAUNCH_DATE.replace(tzinfo=timezone.utc)
-    except (ValueError, TypeError):
-        BOT_LAUNCH_DATE = datetime(2026, 9, 10, 0, 0, 0, tzinfo=timezone.utc)
-else:
-    BOT_LAUNCH_DATE = datetime(2026, 9, 10, 0, 0, 0, tzinfo=timezone.utc)
-
 
 def _load_subscribers() -> dict:
     """Load subscribers from JSON file."""
@@ -89,6 +74,23 @@ def get_subscriber_count() -> int:
         return len(data)
 
 
+def get_subscriber_join_date(chat_id: int) -> datetime | None:
+    """Return the UTC join timestamp for a subscriber, or None if not found."""
+    with _lock:
+        data = _load_subscribers()
+        chat_id_str = str(chat_id)
+        info = data.get(chat_id_str)
+        if info is None:
+            return None
+        joined_iso = info.get("joined_at")
+        if not joined_iso:
+            return None
+        try:
+            return datetime.fromisoformat(joined_iso).replace(tzinfo=timezone.utc)
+        except (ValueError, TypeError):
+            return None
+
+
 def get_subscriber_info(chat_id: int) -> dict:
     """
     Get subscriber info including join date.
@@ -100,19 +102,3 @@ def get_subscriber_info(chat_id: int) -> dict:
         if chat_id_str not in data:
             return None
         return data[chat_id_str]
-
-
-def get_subscriber_join_date(chat_id: int) -> datetime:
-    """
-    Get the UTC datetime when a user joined.
-    Returns None if not found.
-    """
-    info = get_subscriber_info(chat_id)
-    if info and "joined_at" in info:
-        return datetime.fromisoformat(info["joined_at"])
-    return None
-
-
-def get_bot_launch_date() -> datetime:
-    """Return the bot launch date in UTC."""
-    return BOT_LAUNCH_DATE

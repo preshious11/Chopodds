@@ -152,6 +152,10 @@ def ensure_populated(fetch_fn) -> dict:
 
         # We are the first caller — fetch and populate
         logger.info("Populating daily odds cache (first request of the day)...")
+        # Local import to avoid a circular module-level dependency
+        # (odds_client imports daily_cache at module load time).
+        from odds_client import OddsAPIError
+
         try:
             sports_data = fetch_fn() or {}
             total_events = sum(
@@ -176,7 +180,11 @@ def ensure_populated(fetch_fn) -> dict:
                 total_events, len(sports_data), cache_path,
             )
             return sports_data
-        except (ConnectionError, TimeoutError, OSError) as e:
+        except (ConnectionError, TimeoutError, OSError, OddsAPIError) as e:
+            # OddsAPIError covers the total-provider-outage case (every
+            # provider failed for every sport). Handle it like the other
+            # failure types: log, return whatever we have (possibly empty) and
+            # let the next user's request retry — never crash the request.
             logger.error(f"Failed to populate daily cache: {e}")
             # Return whatever we have (might be empty dict)
             return get_cached_odds()

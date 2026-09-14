@@ -23,6 +23,7 @@ from telegram.ext import (
     ContextTypes,
 )
 from telegram.error import BadRequest, TelegramError, NetworkError, TimedOut
+from telegram.request import HTTPXRequest
 
 import config
 from daily_cache import (
@@ -38,7 +39,12 @@ import odds_client
 import predictions
 from settlement import settle_pending_predictions
 import tracking
-from predictions import generate_daily_predictions, get_top_picks, filter_by_sport
+from predictions import (
+    generate_daily_predictions,
+    get_top_picks,
+    get_all_picks,
+    filter_by_sport,
+)
 from subscribers import (
     add_subscriber,
     get_all_chat_ids,
@@ -284,11 +290,16 @@ async def dailypick(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     else:
         await update.message.reply_text(output, parse_mode="HTML", reply_markup=reply_markup)
-    record_prediction_delivery(update.effective_user.id, top)
     tracking.record_predictions(top, update.effective_user.id)
 
 async def toppicks(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /toppicks — show paginated predictions."""
+    """Handle /toppicks — show all-picks accumulator (65%+ probability).
+
+    The all-picks accumulator targets combined odds of 10.0 with up to 10
+    legs, using a 65% probability floor. Exact match+pick pairings already
+    used in the top-picks accumulator are excluded so the same selection
+    never appears in both /dailypick and /toppicks.
+    """
     loading_msg = await _send_loading(update, context)
     predictions = await get_today_predictions()
 
@@ -299,7 +310,12 @@ async def toppicks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    await send_paginated_predictions(update, context, predictions, page=1, loading_msg=loading_msg)
+    top = get_top_picks(predictions)
+    all_picks = get_all_picks(predictions, top)
+
+    await send_paginated_predictions(
+        update, context, all_picks, page=1, loading_msg=loading_msg
+    )
 
 
 async def send_paginated_predictions(
@@ -362,7 +378,6 @@ async def send_paginated_predictions(
                 msg, parse_mode="HTML", reply_markup=reply_markup
             )
         if hasattr(update_or_query, "message"):
-            record_prediction_delivery(update_or_query.effective_user.id, predictions)
             tracking.record_predictions(predictions, update_or_query.effective_user.id)
     except BadRequest as e:
         if "Message is not modified" in str(e):
@@ -398,7 +413,6 @@ async def sports_filter(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         format_sport_filter_buttons(predictions), parse_mode="HTML", reply_markup=reply_markup
     )
-    record_prediction_delivery(update.effective_user.id, predictions)
     tracking.record_predictions(predictions, update.effective_user.id)
 
 
@@ -594,6 +608,7 @@ async def force_refresh_cache(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 # ============================================================================
 # Callback Query Handlers
+
 # ============================================================================
 
 
@@ -611,11 +626,13 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Parse callback data
     parts = data.split(":")
 
-    # Handle "top:p:X" — paginated all predictions
+        # Handle "top:p:X" — paginated all-picks accumulator
     if parts[0] == "top" and parts[1] == "p":
         page = int(parts[2])
         predictions = await get_today_predictions()
-        await send_paginated_predictions(query, context, predictions, page=page)
+        top = get_top_picks(predictions)
+        all_picks = get_all_picks(predictions, top)
+        await send_paginated_predictions(query, context, all_picks, page=page)
         return
 
     # Handle "sport:NAME:X" — filtered by sport with pagination
@@ -682,9 +699,11 @@ async def send_filtered_predictions(
 
 async def daily_broadcast(context: ContextTypes.DEFAULT_TYPE):
     """Send daily broadcast to all subscribers."""
+    today_utc_str = _today_utc_str()
     chat_ids = get_all_chat_ids()
     if not chat_ids:
         log.info("No subscribers for daily broadcast")
+        tracking.mark_daily_broadcast_run(today_utc_str)
         return
 
     predictions = await get_today_predictions()
@@ -702,6 +721,7 @@ async def daily_broadcast(context: ContextTypes.DEFAULT_TYPE):
             except TelegramError as e:
                 log.warning(f"Failed to send broadcast to {chat_id}: {e}")
         log.warning("No predictions available for daily broadcast - sent empty state to subscribers")
+        tracking.mark_daily_broadcast_run(today_utc_str)
         return
 
     msg = format_top_picks(top, count=config.DAILY_PICK_COUNT)
@@ -717,7 +737,6 @@ async def daily_broadcast(context: ContextTypes.DEFAULT_TYPE):
                 text=msg,
                 parse_mode="HTML",
             )
-            record_prediction_delivery(chat_id, top)
             tracking.record_predictions(top, chat_id)
             sent += 1
         except TelegramError as e:
@@ -725,6 +744,7 @@ async def daily_broadcast(context: ContextTypes.DEFAULT_TYPE):
             failed += 1
 
     log.info(f"Daily broadcast sent: {sent} success, {failed} failed")
+    tracking.mark_daily_broadcast_run(today_utc_str)
 
 
 async def settlement_job(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -762,9 +782,104 @@ async def log_handler_error(update: object, context: ContextTypes.DEFAULT_TYPE):
     # and surfaced later via /status. The handler simply stays silent.
 
 
+# Holds references to fire-and-forget background tasks so they are not
+# garbage-collected mid-run.
+_BACKGROUND_TASKS: set[asyncio.Task] = set()
+
+
+async def _warm_daily_cache_background() -> None:
+    """Populate the daily odds cache without delaying startup or handlers.
+
+    Runs after the bot is already polling. If the cache is already valid for
+    today (e.g. a normal same-day restart), it is a cheap no-op; otherwise the
+    odds fetch happens in a worker thread so the event loop stays responsive.
+    """
+    try:
+        if validate_daily_cache():
+            log.info("[CACHE] Daily odds cache already valid; skipping warm-up")
+            return
+        log.info("[CACHE] Beginning background daily odds cache population")
+        await asyncio.to_thread(ensure_populated, _fetch_all_sports_odds)
+        log.info("[CACHE] Background daily odds cache population complete")
+    except Exception as exc:  # noqa: BLE001 — never let warm-up crash the bot
+        log.error("[CACHE] Background daily odds cache population failed: %r", exc)
+
+
+def _schedule_cache_warmup() -> None:
+    """Kick off the deferred cache population as a non-blocking task."""
+    task = asyncio.create_task(_warm_daily_cache_background())
+    _BACKGROUND_TASKS.add(task)
+    task.add_done_callback(_BACKGROUND_TASKS.discard)
+
+
+def _today_utc_str() -> str:
+    """Today's date as a UTC ``YYYY-MM-DD`` string."""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+
+async def _check_missed_broadcast(app) -> None:
+    """Catch up on today's daily broadcast if it was missed while the bot was down.
+
+    Runs ~5 seconds after polling is active so boot stays fast. The catch-up is
+    scheduled through the JobQueue (which supplies a real callback context) and
+    therefore executes asynchronously without blocking the event loop.
+    """
+    try:
+        await asyncio.sleep(5)
+        today_utc_str = _today_utc_str()
+        if tracking.has_daily_broadcast_run(today_utc_str):
+            log.info(
+                f"[STARTUP] Daily broadcast already completed for {today_utc_str}. "
+                "Skipping catch-up."
+            )
+            return
+
+        log.info(
+            f"[STARTUP] Missed scheduled daily broadcast for {today_utc_str}. "
+            "Triggering catch-up broadcast now..."
+        )
+        if app.job_queue is not None:
+            app.job_queue.run_once(
+                daily_broadcast, when=0, name="catchup_daily_broadcast"
+            )
+            # Idempotent: prevents duplicate/infinite catch-up across restarts.
+            tracking.mark_daily_broadcast_run(today_utc_str)
+        else:
+            # No JobQueue exists (so the original broadcast was never scheduled);
+            # record the date so we do not attempt a looping catch-up, and warn.
+            tracking.mark_daily_broadcast_run(today_utc_str)
+            log.warning(
+                "[STARTUP] Job queue unavailable — could not schedule catch-up "
+                "daily broadcast."
+            )
+    except Exception as exc:  # noqa: BLE001 — catch-up must never crash the bot
+        log.error("[STARTUP] Catch-up broadcast check failed: %r", exc)
+
+
+def _schedule_missed_broadcast_check(app) -> None:
+    """Kick off the deferred missed-broadcast check as a non-blocking task."""
+    task = asyncio.create_task(_check_missed_broadcast(app))
+    _BACKGROUND_TASKS.add(task)
+    task.add_done_callback(_BACKGROUND_TASKS.discard)
+
+
 async def run_bot() -> None:
     """Start the bot and shut it down cleanly on termination signals."""
-    app = Application.builder().token(config.TELEGRAM_BOT_TOKEN).build()
+    startup_started = time.perf_counter()
+    # Configure longer network timeouts so the bot survives slow connections
+    # instead of failing with a TimedOut during get_me / start_polling.
+    telegram_request = HTTPXRequest(
+        connect_timeout=30.0,
+        read_timeout=30.0,
+        write_timeout=30.0,
+        pool_timeout=10.0,
+    )
+    app = (
+        Application.builder()
+        .token(config.TELEGRAM_BOT_TOKEN)
+        .request(telegram_request)
+        .build()
+    )
     shutdown_event = asyncio.Event()
 
     def request_shutdown() -> None:
@@ -785,9 +900,13 @@ async def run_bot() -> None:
                 ),
             )
 
-    if not validate_daily_cache():
-        log.info("Daily odds cache is missing or invalid; regenerating it")
-        await asyncio.to_thread(ensure_populated, _fetch_all_sports_odds)
+    # Cache warming is DEFERRED to a background task that runs only after the
+    # bot is already polling, so the app never blocks startup (or requests) on
+    # the external odds fetch.
+    log.info(
+        "Daily odds cache warm-up deferred to a non-blocking background task "
+        "after the bot starts polling."
+    )
 
     # Command handlers
     app.add_handler(CommandHandler("start", start))
@@ -822,7 +941,7 @@ async def run_bot() -> None:
         )
         app.job_queue.run_repeating(
             settlement_job,
-            interval=24 * 60 * 60,
+            interval=60 * 60,
             first=120,
             name="settle_pending_predictions",
         )
@@ -841,17 +960,28 @@ async def run_bot() -> None:
         try:
             await app.initialize()
             await app.start()
+            # Drop any webhook so polling cannot conflict with it.
+            await app.bot.delete_webhook(drop_pending_updates=True)
             await app.updater.start_polling()
             break
         except (TimedOut, NetworkError) as exc:
             if attempt == handshake_attempts:
                 raise
-            wait = attempt * 5
+            wait = min(attempt * 3, 10)
             log.warning(
                 f"Telegram connection failed on startup attempt {attempt}/"
                 f"{handshake_attempts} ({exc!r}); retrying in {wait}s"
             )
             await asyncio.sleep(wait)
+
+    # Polling is active — start the deferred, non-blocking cache warm-up and
+    # report startup time. This runs in the background and never holds up any
+    # Telegram command handler.
+    _schedule_cache_warmup()
+    log.info(
+        "[STARTUP] Bot initialized and polling active in %.2f seconds.",
+        time.perf_counter() - startup_started,
+    )
 
     try:
         await shutdown_event.wait()

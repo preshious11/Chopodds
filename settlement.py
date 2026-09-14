@@ -7,6 +7,8 @@ from typing import Any
 import httpx
 
 import config
+import odds_client
+import stats
 import tracking
 from predictions import SPORT_KEY_MAP
 
@@ -52,7 +54,7 @@ def _settle_pick(prediction: dict[str, Any], scores: list[dict[str, Any]]) -> st
     if home_score is None or away_score is None:
         return None
 
-    pick = str(prediction.get("pick", ""))
+    pick = str(prediction.get("pick") or prediction.get("selection") or "")
     market = prediction.get("market_type")
     if market == "h2h":
         if home_score == away_score:
@@ -111,6 +113,8 @@ async def _fetch_scores(client: httpx.AsyncClient, sport_key: str) -> list[dict[
             },
         )
         response.raise_for_status()
+        # Monitor remaining credits after every scores fetch.
+        odds_client.log_scores_quota(response.headers, sport_key)
         payload = response.json()
         return payload if isinstance(payload, list) else []
     except (httpx.TimeoutException, httpx.HTTPError, ValueError) as exc:
@@ -119,21 +123,44 @@ async def _fetch_scores(client: httpx.AsyncClient, sport_key: str) -> list[dict[
 
 
 async def settle_pending_predictions() -> None:
-    """Fetch scores once for pending sports and settle completed predictions."""
-    pending = tracking.get_pending_predictions()
-    if not pending:
+    """Credit-optimized, kick-off-aware settlement of pending predictions.
+
+    Only matches whose kick-off has elapsed long enough for a result to exist
+    (and that are not stale beyond the polling window) are polled. Scores are
+    fetched only for the unique sports among those eligible matches, so an idle
+    run fetches nothing and costs 0 API credits.
+    """
+    eligible = tracking.get_eligible_pending_predictions()
+    if not eligible:
+        logger.info(
+            "[Settlement Skipped] 0 pending matches eligible for completion check."
+        )
         return
+
+    active_sports = _active_sport_keys(eligible)
+    if not active_sports:
+        logger.warning(
+            "[Settlement Skipped] %d eligible pending matches but no resolvable "
+            "sport keys — 0 API credits used.", len(eligible),
+        )
+        return
+
+    logger.info(
+        "[Settlement] %d eligible matches across %d sport(s): %s",
+        len(eligible), len(active_sports), ", ".join(active_sports),
+    )
 
     evaluated = wins = losses = voids = 0
     grouped: dict[str, list[dict[str, Any]]] = {}
-    for prediction in pending:
-        sport_key = _league_to_sport_key(prediction.get("league", ""))
+    for prediction in eligible:
+        sport_key = prediction.get("sport_key") or _league_to_sport_key(
+            prediction.get("league", "")
+        )
         if sport_key:
             grouped.setdefault(sport_key, []).append(prediction)
-        else:
-            logger.warning("No sport key found for pending prediction %s", prediction.get("event_id"))
 
     async with httpx.AsyncClient(timeout=15.0) as client:
+        # Fetch scores ONLY for the sports that have eligible matches.
         for sport_key, predictions in grouped.items():
             scores = await _fetch_scores(client, sport_key)
             scores_by_id = {str(item.get("id")): item for item in scores}
@@ -161,6 +188,10 @@ async def settle_pending_predictions() -> None:
                         prediction.get("event_id"),
                         result,
                     )
+    # Invalidate the /stats cache only when records actually changed, so
+    # repeated /stats requests reflect newly settled matches immediately.
+    if evaluated > 0:
+        stats.invalidate_stats_cache()
     tracking.set_last_score_fetch()
     logger.info(
         "Settlement Complete: %s matches evaluated | %s Wins | %s Losses | %s Void",
@@ -169,3 +200,21 @@ async def settle_pending_predictions() -> None:
         losses,
         voids,
     )
+
+
+def _active_sport_keys(predictions: list[dict[str, Any]]) -> list[str]:
+    """Return the ordered, unique sport keys among the eligible matches.
+
+    Prefers the ``sport_key`` stored on each tracked row; falls back to
+    resolving the league name when it is absent.
+    """
+    seen: set[str] = set()
+    keys: list[str] = []
+    for prediction in predictions:
+        sport_key = prediction.get("sport_key") or _league_to_sport_key(
+            prediction.get("league", "")
+        )
+        if sport_key and sport_key not in seen:
+            seen.add(sport_key)
+            keys.append(sport_key)
+    return keys

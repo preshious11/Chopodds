@@ -13,8 +13,6 @@ Covers:
 Run: python -m pytest test_stats_accumulator.py -v
 """
 
-from collections import Counter
-
 import pytest
 
 import tracking

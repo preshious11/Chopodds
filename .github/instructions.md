@@ -1,7 +1,7 @@
 # Telegram Sports Prediction Bot - Development Instructions
 
 ## Core Business & API Rules
-- STRICT DAILY CACHING: Do not alter or bypass local daily caching logic (12:00 AM reset). Always serve subsequent user requests from local cache files (`daily_odds_cache.json`) to conserve Odds API credits.
+- STRICT DAILY CACHING: Do not alter or bypass local daily caching logic (12:00 AM reset). Always serve subsequent user requests from the local cache files (`.daily_cache/odds_YYYY-MM-DD.json` under `DATA_DIR`) to conserve Odds API credits.
 - MATCH PREDICTION SELECTION: Enforce the "1 match = 1 top prediction" rule by selecting only the single highest-probability prediction per event across all markets.
 - SPORT SCOPE: Restrict Odds API calls exclusively to Football (Soccer) and Tennis endpoints.
 - CONFIDENCE TIERS & SAFETY FLOORS:

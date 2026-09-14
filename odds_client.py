@@ -1,101 +1,42 @@
 """
-Thin client for The Odds API (https://the-odds-api.com).
-Uses a shared daily cache (Africa/Lagos timezone) to minimize API calls.
-All users share the same daily dataset — only the first request of the day
-triggers API calls. Pagination, stats, and subsequent users read from cache.
+Odds data client with automatic provider failover.
+
+Providers are tried in order (config.ODDS_PROVIDER_ORDER, by default
+The Odds API -> SharpAPI -> SportsGameOdds). A provider only receives the
+leagues the providers before it could not answer. The Odds API is queried one
+league at a time; the fallback providers fetch all of their leagues in one
+paginated request, so their free-tier rate limits hold.
+
+The merged result is cached once per Africa/Lagos day by daily_cache, so on a
+normal day the providers are called once. Every event is normalized to The
+Odds API's shape — {id, home_team, away_team, commence_time, bookmakers:
+[{key, markets: [{key, outcomes: [{name, price, point}]}]}]} — and tagged
+with the "source" provider that supplied it.
 """
 
-import requests
-import config
 import logging
-import os
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from threading import Lock
+from collections import Counter
+from datetime import datetime, timezone
+from typing import Callable
 
+from zoneinfo import ZoneInfo
+
+import requests
+
+import config
 from daily_cache import ensure_populated
 
 BASE_URL = "https://api.the-odds-api.com/v4"
+LAGOS_TZ = ZoneInfo("Africa/Lagos")
+
+PROVIDER_ODDS_API = "the-odds-api"
+PROVIDER_SHARPAPI = "sharpapi"
+PROVIDER_SPORTSGAMEODDS = "sportsgameodds"
 
 logger = logging.getLogger(__name__)
 
-# Max concurrent API requests during cache population
-_MAX_WORKERS = 4
-
-# Providers that returned 401 (invalid key) or 429 (quota exhausted) during
-# the current daily fetch cycle. Checked before every provider attempt and
-# reset at the start of each daily fetch, so it only lives as long as the
-# daily cache does. Without it, each of the ~13 concurrent sport fetches
-# would independently re-attempt a dead primary provider before falling
-# through to the next one.
-_dead_providers_today: set[str] = set()
-_dead_providers_lock = Lock()
-
-
-def _mark_provider_dead(provider_name: str) -> None:
-    """Record that a provider is dead (401/429) for this daily fetch cycle."""
-    with _dead_providers_lock:
-        if provider_name not in _dead_providers_today:
-            _dead_providers_today.add(provider_name)
-            logger.warning(
-                "Provider %s marked dead for the rest of this daily fetch "
-                "(401/429) — remaining sports will skip straight past it.",
-                provider_name,
-            )
-
-
-def _is_provider_dead(provider_name: str) -> bool:
-    with _dead_providers_lock:
-        return provider_name in _dead_providers_today
-
-
-def _reset_dead_providers() -> None:
-    """Clear the dead-provider set (called at the start of each daily fetch)."""
-    with _dead_providers_lock:
-        _dead_providers_today.clear()
-
-
-# ---------------------------------------------------------------------------
-# Temporary cooldown (Part 8): a provider that times out / 5xx's / cannot be
-# reached is skipped for a short window so we do not hammer it on every sport
-# fetch, but it automatically becomes eligible again after the cooldown.
-# Unlike _dead_providers_today (401/429 = auth/quota, dead for the daily
-# cycle), a cooldown is a short, transient, auto-expiring penalty.
-# ---------------------------------------------------------------------------
-_PROVIDER_COOLDOWN_SECONDS = float(
-    os.environ.get("PROVIDER_COOLDOWN_SECONDS", "60")
-)
-_provider_cooldowns: dict[str, float] = {}   # name -> monotonic expiry
-_cooldowns_lock = Lock()
-
-
-def _cooldown_active(provider_name: str) -> bool:
-    with _cooldowns_lock:
-        return _provider_cooldowns.get(provider_name, 0.0) > time.monotonic()
-
-
-def _start_cooldown(provider_name: str) -> None:
-    with _cooldowns_lock:
-        _provider_cooldowns[provider_name] = (
-            time.monotonic() + _PROVIDER_COOLDOWN_SECONDS
-        )
-    logger.info(
-        "[ODDS] %s temporarily unavailable — cooling down for %ds",
-        provider_name, int(_PROVIDER_COOLDOWN_SECONDS),
-    )
-
-
-def _clear_cooldown(provider_name: str) -> None:
-    """A successful response proves the provider is healthy again."""
-    with _cooldowns_lock:
-        _provider_cooldowns.pop(provider_name, None)
-
-
-def _reset_cooldowns() -> None:
-    with _cooldowns_lock:
-        _provider_cooldowns.clear()
-
-# Last observed API quota info (parsed from response headers).
+# Last observed The Odds API quota info (parsed from response headers).
 # Exposed for the admin /status diagnostic.
 _last_quota = {
     "remaining": None,
@@ -103,33 +44,105 @@ _last_quota = {
     "error": None,   # last HTTP error encountered, if any
 }
 
+# Outcome of the last daily fetch, for /status:
+# {"at": iso, "providers": {name: {...}}, "sources": {sport_key: provider}}
+_last_fetch_report: dict = {}
+
+_HTTP_ERRORS = {
+    401: "Invalid API key (HTTP 401)",
+    429: "Rate limited (HTTP 429)",
+}
+_TRANSIENT_STATUSES = {408, 500, 502, 503, 504}
+# Waits before retrying a burst rate limit (HTTP 429). The Odds API docs:
+# "try spacing out requests over several seconds".
+_RATE_LIMIT_BACKOFF_SECONDS = (2.0, 5.0, 10.0)
+# Longest server-requested wait honoured before giving up on a fallback provider.
+_MAX_RETRY_AFTER_SECONDS = 15.0
+# The Odds API: stop after this many leagues in a row fail outright.
+_MAX_CONSECUTIVE_LEAGUE_FAILURES = 3
+
+# Fallback provider league mappings, keyed by our (The Odds API style) sport
+# keys. Tennis entries also match tournament keys by prefix
+# (tennis_atp_us_open -> tennis_atp).
+# SharpAPI slugs — docs.sharpapi.io/en/api-reference/leagues
+# ("League IDs use canonical slug form (england_-_premier_league, not epl)").
+_SHARPAPI_LEAGUES = {
+    "soccer_epl": "soccer/england_-_premier_league",
+    "soccer_spain_la_liga": "soccer/spain_-_la_liga",
+    "soccer_italy_serie_a": "soccer/italy_-_serie_a",
+    "soccer_germany_bundesliga": "soccer/germany_-_bundesliga",
+    "soccer_france_ligue_one": "soccer/france_-_ligue_1",
+    "soccer_uefa_champs_league": "soccer/uefa_-_champions_league",
+    "soccer_usa_mls": "soccer/usa_-_major_league_soccer",
+    "tennis_atp": "tennis/atp",
+    "tennis_wta": "tennis/wta",
+}
+# SharpAPI market ids -> pipeline market keys.
+_SHARPAPI_MARKETS = {
+    "moneyline": "h2h",
+    "point_spread": "spreads",
+    "total_goals": "totals",
+}
+# SportsGameOdds leagueIDs — sportsgameodds.com/docs/data-types/leagues
+_SPORTSGAMEODDS_LEAGUES = {
+    "soccer_epl": "EPL",
+    "soccer_spain_la_liga": "LA_LIGA",
+    "soccer_italy_serie_a": "IT_SERIE_A",
+    "soccer_germany_bundesliga": "BUNDESLIGA",
+    "soccer_france_ligue_one": "FR_LIGUE_1",
+    "soccer_uefa_champs_league": "UEFA_CHAMPIONS_LEAGUE",
+    "soccer_uefa_europa_league": "UEFA_EUROPA_LEAGUE",
+    "soccer_netherlands_eredivisie": "EREDIVISIE",
+    "soccer_usa_mls": "MLS",
+    "tennis_atp": "ATP",
+    "tennis_wta": "WTA",
+}
+
+
+class OddsAPIError(Exception):
+    """No odds could be obtained (bad keys, exhausted quotas, outage)."""
+
+
+def _api_key() -> str:
+    """Return the configured The Odds API key without shell/dotenv quoting noise."""
+    return str(config.ODDS_API_KEY or "").strip().strip('"\'').strip()
+
 
 def get_last_quota() -> dict:
     """Return the last observed Odds API quota info from response headers."""
     return dict(_last_quota)
 
 
-def _record_quota(headers, sport_key: str, ok: bool) -> None:
-    """Parse and log Odds API quota headers from a response."""
+def get_last_fetch_report() -> dict:
+    """Return which provider served each league in the last daily fetch."""
+    return dict(_last_fetch_report)
+
+
+def _record_quota(headers, label: str) -> None:
+    """Parse and log The Odds API quota headers from a response."""
     remaining = headers.get("x-requests-remaining")
     used = headers.get("x-requests-used")
-    if remaining is not None:
-        _last_quota["remaining"] = remaining
-        _last_quota["used"] = used
-        try:
-            if int(remaining) == 0:
-                logger.critical(
-                    "[CRITICAL] Odds API quota exhausted (0 requests remaining) "
-                    "after fetching %s. Bot cannot fetch new odds until the "
-                    "quota resets. Used: %s", sport_key, used,
-                )
-                return
-        except (TypeError, ValueError):
-            pass
+    if remaining is None:
+        return
+    _last_quota["remaining"] = remaining
+    _last_quota["used"] = used
+    if _quota_exhausted(headers):
+        logger.critical(
+            "[CRITICAL] Odds API quota exhausted (0 requests remaining) after "
+            "%s. Used: %s", label, used,
+        )
+    else:
         logger.info(
             "Odds API quota after %s: %s requests remaining, %s used",
-            sport_key, remaining, used,
+            label, remaining, used,
         )
+
+
+def _quota_exhausted(headers) -> bool:
+    try:
+        return int(float(headers.get("x-requests-remaining"))) <= 0
+    except (TypeError, ValueError):
+        return False
 
 
 def log_scores_quota(headers, sport_key: str) -> None:
@@ -152,9 +165,11 @@ def log_scores_quota(headers, sport_key: str) -> None:
 
 def check_api_key() -> dict:
     """
-    Verify the ODDS_API_KEY against the /sports endpoint (cheap, no quota
-    consumed for invalid keys) and return a diagnostic dict:
+    Verify the ODDS_API_KEY against the /sports endpoint (does not consume
+    usage credits) and return a diagnostic dict:
     {configured, valid, remaining, used, error}
+
+    Blocking — call it via asyncio.to_thread from async handlers.
     """
     result = {
         "configured": bool(_api_key()),
@@ -170,146 +185,308 @@ def check_api_key() -> dict:
         resp = requests.get(
             f"{BASE_URL}/sports", params={"apiKey": _api_key()}, timeout=15,
         )
-        _record_quota(resp.headers, "api-key-check", resp.status_code == 200)
+        _record_quota(resp.headers, "api-key-check")
         result["remaining"] = resp.headers.get("x-requests-remaining")
         result["used"] = resp.headers.get("x-requests-used")
         if resp.status_code == 200:
             result["valid"] = True
-        elif resp.status_code == 401:
-            result["error"] = "Invalid API key (HTTP 401)"
-        elif resp.status_code == 429:
-            result["error"] = "Quota exhausted (HTTP 429)"
         else:
-            result["error"] = f"HTTP {resp.status_code}: {resp.text[:120]}"
+            result["error"] = _HTTP_ERRORS.get(
+                resp.status_code, f"HTTP {resp.status_code}: {resp.text[:120]}"
+            )
     except requests.RequestException as e:
         result["error"] = f"Network error: {e}"
     return result
 
 
-class OddsAPIError(Exception):
-    pass
-
-
-def _api_key() -> str:
-    """Return the configured API key without shell/ dotenv quoting noise."""
-    return str(config.ODDS_API_KEY).strip().strip('"\'').strip()
-
-
-def _provider_key(provider: dict) -> str | None:
-    """Resolve the API key for a provider from the environment."""
-    env_var = provider.get("api_key_env", "ODDS_API_KEY")
-    key = os.environ.get(env_var, "").strip().strip('"\'').strip()
-    return key or None
-
-
-# Mapping of SharpAPI (flat row) market types back to the-odds-api-style
-# market keys the pipeline expects ("h2h", "spreads", "totals"). Exact-match
-# on the full market_type string; prop/derived types (team_total_goals etc.)
-# deliberately do NOT match any alias and are skipped.
-_SHARPAPI_MARKET_ALIASES = {
-    "moneyline": "h2h",
-    "match_winner": "h2h",
-    "h2h": "h2h",
-    "point_spread": "spreads",
-    "spread": "spreads",
-    "handicap": "spreads",
-    "asian_handicap": "handicap",
-    "total_goals": "totals",     # soccer O/U (verified live catalog id)
-    "total_points": "totals",    # US-sports O/U catalog id
-    "over_under": "totals",
-    "totals": "totals",
-}
-
-
-def _split_sport_key(sport_key: str) -> tuple[str, str]:
+def get_sports() -> list[dict]:
     """
-    Split a the-odds-api-style sport key (e.g. ``soccer_epl``) into
-    (sport, league) for providers that filter by sport + league instead of
-    exposing a per-sport odds path (SharpAPI v1).
+    Return the sports currently in season from The Odds API. Does not consume
+    usage credits. Raises OddsAPIError on a non-200 response.
     """
-    if "_" in sport_key:
-        sport, _, league = sport_key.partition("_")
-        return sport, league
-    return sport_key, sport_key
+    resp = requests.get(
+        f"{BASE_URL}/sports",
+        params={"apiKey": _api_key()},
+        timeout=config.ODDS_API_TIMEOUT_SECONDS,
+    )
+    if resp.status_code != 200:
+        error = _HTTP_ERRORS.get(resp.status_code, f"HTTP {resp.status_code}")
+        _last_quota["error"] = error
+        raise OddsAPIError(f"Failed to fetch sports list: {error} {resp.text[:200]}")
+    payload = resp.json()
+    return payload if isinstance(payload, list) else []
 
 
-def _build_provider_request(
-    sport_key: str, provider: dict, api_key: str
-) -> tuple[str, dict, dict]:
+# ---------------------------------------------------------------------------
+# Which leagues to fetch
+# ---------------------------------------------------------------------------
+
+def _configured_leagues() -> tuple[list[str], list[str]]:
+    """(fixed sport keys, tennis key prefixes) from predictions.SPORT_KEY_MAP."""
+    # Import here to avoid circular imports at module load time
+    from predictions import SPORT_KEY_MAP
+
+    fixed_keys: list[str] = []
+    prefixes: list[str] = []
+    for leagues in SPORT_KEY_MAP.values():
+        for league in leagues:
+            if league.get("key"):
+                if league["key"] not in fixed_keys:
+                    fixed_keys.append(league["key"])
+            elif league.get("key_prefix"):
+                prefixes.append(league["key_prefix"])
+    return fixed_keys, prefixes
+
+
+def _resolve_fetch_plan() -> tuple[list[str], str | None]:
     """
-    Build (url, params, headers) for a provider-specific odds request.
+    Decide which sport keys to fetch today.
 
-    the-odds-api-style providers use GET /sports/{sport_key}/odds with the key
-    in the "apiKey" query param. SharpAPI v1 uses GET /odds with an X-API-Key
-    header plus sport/league/market filters, because it has no per-sport odds
-    path — see https://docs.sharpapi.io (base URL .../api/v1, endpoint /odds).
+    Uses The Odds API's free /sports list to skip off-season leagues and to
+    find the tennis tournaments in play. If that list is unavailable, every
+    configured league is fetched, with tennis under the generic keys
+    ``tennis_atp`` / ``tennis_wta`` that the fallback providers understand.
+
+    Returns (sport keys, reason The Odds API is unusable or None).
     """
-    base_url = provider["base_url"].rstrip("/")
-    path = provider.get("odds_path", "/sports/{sport_key}/odds")
-    params: dict = {}
-    headers: dict = {}
-
-    if provider.get("sport_key_style") == "sgo":
-        # SportsGameOdds v2: league-wide snapshot, GET /v2/events?leagueID=...
-        # (free tier requires a leagueID). oddsAvailable=true limits to
-        # live/upcoming events with odds; oddIDs slims the payload to the
-        # full-game main markets the pipeline consumes (ml3way = soccer 1X2,
-        # sp = spreads, ou = totals; both "game" and "reg" periods — the
-        # normalizer prefers "reg" for soccer where both exist).
-        league_map = provider.get("league_map", {})
-        league_id = league_map.get(sport_key, sport_key)
-        entities = ("home", "away", "all")
-        periods = ("game", "reg")
-        bets = (
-            "ml3way-home", "ml3way-away", "ml3way-draw",
-            "ml-home", "ml-away",
-            "sp-home", "sp-away", "ou-over", "ou-under",
+    fixed_keys, prefixes = _configured_leagues()
+    generic_keys = fixed_keys + [prefix.rstrip("_") for prefix in prefixes]
+    if not _api_key():
+        return generic_keys, "ODDS_API_KEY not set"
+    try:
+        active = {sport.get("key") for sport in get_sports()}
+    except OddsAPIError as exc:
+        logger.warning("[ODDS] The Odds API unusable for today's fetch: %s", exc)
+        return generic_keys, str(exc)
+    except (requests.RequestException, ValueError) as exc:
+        logger.warning(
+            "[ODDS] Could not load the in-season sports list (%s); fetching "
+            "every configured league", exc,
         )
-        odd_ids = ",".join(
-            f"points-{entity}-{period}-{bet}"
-            for entity in entities
-            for period in periods
-            for bet in bets
+        return generic_keys, None
+
+    off_season = [key for key in fixed_keys if key not in active]
+    if off_season:
+        logger.info("[ODDS] Skipping off-season leagues: %s", ", ".join(off_season))
+    tournaments = sorted(
+        key for key in active
+        if key and any(key.startswith(prefix) for prefix in prefixes)
+    )
+    return [key for key in fixed_keys if key in active] + tournaments, None
+
+
+def _provider_league(sport_key: str, mapping: dict[str, str]) -> str | None:
+    """Map a sport key to a provider league; tennis tournaments match by prefix."""
+    if sport_key in mapping:
+        return mapping[sport_key]
+    for generic, value in mapping.items():
+        if generic.startswith("tennis_") and sport_key.startswith(generic + "_"):
+            return value
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Provider 1: The Odds API
+# ---------------------------------------------------------------------------
+
+def _odds_api_league(sport_key: str) -> tuple[str, list | None]:
+    """
+    Fetch one league from The Odds API.
+
+    Returns ("ok", events) — including a legitimately empty list —,
+    ("failed", None) when only this league failed, or ("stop", None) when the
+    provider cannot be used any more today (bad key, quota or rate limit).
+    """
+    params = {
+        "apiKey": _api_key(),
+        "regions": config.ODDS_REGIONS,
+        "markets": config.ODDS_MARKETS,
+        "oddsFormat": "decimal",
+    }
+    backoff = list(_RATE_LIMIT_BACKOFF_SECONDS)
+    transient_retry = True
+    while True:
+        try:
+            resp = requests.get(
+                f"{BASE_URL}/sports/{sport_key}/odds",
+                params=params,
+                timeout=config.ODDS_API_TIMEOUT_SECONDS,
+            )
+        except requests.RequestException as exc:
+            if transient_retry:
+                transient_retry = False
+                time.sleep(2.0)
+                continue
+            _last_quota["error"] = f"Network error: {str(exc)[:160]}"
+            return "failed", None
+
+        status = resp.status_code
+        if status == 200:
+            try:
+                events = resp.json()
+            except ValueError:
+                events = None
+            if not isinstance(events, list):
+                _last_quota["error"] = "Malformed response"
+                return "failed", None
+            _record_quota(resp.headers, sport_key)
+            logger.info("[ODDS] the-odds-api: %d events for %s", len(events), sport_key)
+            return "ok", events
+        if status == 404:
+            # Unknown or finished sport key: nothing to fetch, not a failure.
+            return "ok", []
+        if status == 401:
+            _last_quota["error"] = _HTTP_ERRORS[401]
+            logger.error("[ODDS] the-odds-api rejected the API key (HTTP 401)")
+            return "stop", None
+        if status == 429:
+            _record_quota(resp.headers, sport_key)
+            if _quota_exhausted(resp.headers):
+                _last_quota["error"] = "Quota exhausted (HTTP 429)"
+                return "stop", None
+            if backoff:
+                wait = backoff.pop(0)
+                logger.warning(
+                    "[ODDS] the-odds-api burst rate limit on %s (HTTP 429); "
+                    "retrying in %.0fs", sport_key, wait,
+                )
+                time.sleep(wait)
+                continue
+            _last_quota["error"] = _HTTP_ERRORS[429]
+            return "stop", None
+        if status in _TRANSIENT_STATUSES and transient_retry:
+            transient_retry = False
+            time.sleep(2.0)
+            continue
+        _last_quota["error"] = f"HTTP {status}"
+        logger.warning(
+            "[ODDS] the-odds-api HTTP %d for %s: %s", status, sport_key, resp.text[:200]
         )
-        params["apiKey"] = api_key
-        params["leagueID"] = league_id
-        params["oddsAvailable"] = "true"
-        params["oddIDs"] = odd_ids
-        params["limit"] = provider.get("page_limit", 50)
-        return f"{base_url}{path}", params, headers
+        return "failed", None
 
-    if "sport_key_style" in provider:
-        # Flat snapshot endpoint (SharpAPI): filter by sport/league/market.
-        sport, league = _split_sport_key(sport_key)
-        params["sport"] = sport
-        params["league"] = league
-        market_map = provider.get("market_map", {})
-        mapped_markets = [
-            market_map.get(m, m) for m in config.ODDS_MARKETS.split(",")
-        ]
-        params[provider.get("market_param", "market")] = ",".join(mapped_markets)
-        params[provider.get("odds_format_param", "odds_format")] = "decimal"
-        if provider.get("auth_mode", "query") == "header":
-            headers["X-API-Key"] = api_key
-        else:
-            params["api_key"] = api_key
-        return f"{base_url}{path}", params, headers
 
-    # the-odds-api-style per-sport endpoint
-    url = f"{base_url}{path.format(sport_key=sport_key)}"
-    params["apiKey"] = api_key
-    params["regions"] = config.ODDS_REGIONS
-    params["markets"] = config.ODDS_MARKETS
-    params["oddsFormat"] = "decimal"
-    return url, params, headers
+def _fetch_from_odds_api(sport_keys: list[str]) -> tuple[dict, str | None]:
+    """Fetch leagues one at a time. Returns ({sport_key: events}, last error)."""
+    answered: dict[str, list] = {}
+    error = None
+    consecutive_failures = 0
+    for sport_key in sport_keys:
+        outcome, events = _odds_api_league(sport_key)
+        if outcome == "ok":
+            answered[sport_key] = events
+            consecutive_failures = 0
+            continue
+        error = _last_quota["error"]
+        if outcome == "stop":
+            break
+        consecutive_failures += 1
+        if consecutive_failures >= _MAX_CONSECUTIVE_LEAGUE_FAILURES:
+            logger.warning(
+                "[ODDS] the-odds-api failed %d leagues in a row; handing the "
+                "rest to the fallback providers", consecutive_failures,
+            )
+            break
+    return answered, error
+
+
+# ---------------------------------------------------------------------------
+# Shared HTTP helpers for the fallback providers
+# ---------------------------------------------------------------------------
+
+def _retry_after_seconds(resp) -> float | None:
+    """Seconds to wait from a Retry-After header or a JSON retry_after field."""
+    raw = resp.headers.get("retry-after")
+    if raw is None:
+        try:
+            body = resp.json()
+        except ValueError:
+            body = None
+        if isinstance(body, dict):
+            nested = body.get("error") if isinstance(body.get("error"), dict) else {}
+            raw = body.get("retry_after", nested.get("retry_after"))
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if value > 1e11:        # Unix timestamp in milliseconds (SharpAPI)
+        value = value / 1000 - time.time()
+    elif value > 1000:      # a duration in milliseconds
+        value = value / 1000
+    return max(value, 1.0)
+
+
+def _provider_get(
+    provider: str, url: str, params: dict, headers: dict
+) -> tuple[object | None, str | None]:
+    """GET a fallback-provider endpoint. Returns (json body, None) or (None, error)."""
+    transient_retry = True
+    rate_limit_retry = True
+    while True:
+        try:
+            resp = requests.get(
+                url, params=params, headers=headers,
+                timeout=config.ODDS_API_TIMEOUT_SECONDS,
+            )
+        except requests.RequestException as exc:
+            if transient_retry:
+                transient_retry = False
+                time.sleep(2.0)
+                continue
+            return None, f"network error: {str(exc)[:160]}"
+
+        status = resp.status_code
+        if status == 200:
+            try:
+                return resp.json(), None
+            except ValueError:
+                return None, "malformed JSON response"
+        if status == 429 and rate_limit_retry:
+            wait = _retry_after_seconds(resp) or 5.0
+            if wait <= _MAX_RETRY_AFTER_SECONDS:
+                rate_limit_retry = False
+                logger.warning("[ODDS] %s rate limited; retrying in %.0fs", provider, wait)
+                time.sleep(wait)
+                continue
+        if status in _TRANSIENT_STATUSES and transient_retry:
+            transient_retry = False
+            time.sleep(2.0)
+            continue
+        return None, f"HTTP {status}: {resp.text[:200]}"
+
+
+def _get_paginated(
+    provider: str,
+    url: str,
+    params: dict,
+    headers: dict,
+    next_cursor: Callable[[dict], str | None],
+) -> tuple[list, str | None]:
+    """Read every page of a cursor-paginated {"data": [...]} endpoint."""
+    items: list = []
+    cursor = None
+    for _ in range(max(1, config.FALLBACK_MAX_PAGES)):
+        page_params = dict(params)
+        if cursor:
+            page_params["cursor"] = cursor
+        body, error = _provider_get(provider, url, page_params, headers)
+        if error:
+            return items, error
+        data = body.get("data") if isinstance(body, dict) else None
+        if not isinstance(data, list):
+            return items, "unexpected response shape (no data list)"
+        items.extend(data)
+        cursor = next_cursor(body)
+        if not cursor or not data:
+            return items, None
+    logger.warning(
+        "[ODDS] %s: stopped after %d pages; some odds were not read",
+        provider, config.FALLBACK_MAX_PAGES,
+    )
+    return items, None
 
 
 def _decimal_price(raw) -> float | None:
-    """Extract a decimal price from a SharpAPI odds value.
-
-    SharpAPI rows may carry odds as a plain number or as an object like
-    {"american": -110, "decimal": 1.91}. Tolerant to both.
-    """
+    """A decimal price from a number or an object like {"decimal": 1.91}."""
     if isinstance(raw, dict):
         for key in ("decimal", "price", "value"):
             if key in raw:
@@ -321,133 +498,26 @@ def _decimal_price(raw) -> float | None:
         price = float(raw)
     except (TypeError, ValueError):
         return None
-    return price if price >= 1.01 else None
-
-
-def _normalize_sharpapi_rows(rows) -> list[dict]:
-    """
-    Rebuild the-odds-api-style events from SharpAPI flat odds rows.
-
-    SharpAPI /odds returns one row per (event, market, selection, book), e.g.
-    {"event_name": "Celtics @ Lakers", "market_type": "moneyline",
-     "selection": "Lakers", "book": "draftkings", "odds": {...}}.
-    Group those rows into events -> bookmakers -> markets -> outcomes so the
-    prediction pipeline can consume the response unchanged.
-    """
-    events_by_key: dict[str, dict] = {}
-    for row in rows if isinstance(rows, list) else []:
-        if not isinstance(row, dict):
-            continue
-        # Verified live: rows carry is_active / is_impossible_scoreline flags.
-        if row.get("is_active") is False or row.get("is_impossible_scoreline"):
-            continue
-        # Pre-match bot: exclude live/in-play rows outright (is_live is a real
-        # boolean field verified in live responses). A live row such as
-        # "Man Utd @ 101.0" must never enter the prediction pipeline.
-        if row.get("is_live"):
-            continue
-        # Alternate-line protection: even among rows that slip past the live
-        # filter, never mix alternate lines (e.g. Over 3.5 @ 81 next to
-        # Over 2.5 @ 2.98) that share a market key and would corrupt any
-        # consensus/average computed across outcomes.
-        if row.get("is_main_line") is False and row.get("is_live"):
-            continue
-        # Verified live: rows carry no event_name — identify events by
-        # event_id (or home/away pair) instead.
-        home_name = str(row.get("home_team") or "").strip()
-        away_name = str(row.get("away_team") or "").strip()
-        event_name = str(
-            row.get("event_name") or row.get("matchup") or row.get("event") or ""
-        ).strip()
-        event_id = str(row.get("event_id") or row.get("id") or "")
-        if not event_id and not (home_name or away_name or event_name):
-            continue
-        if not event_name:
-            event_name = " vs ".join(x for x in (home_name, away_name) if x)
-        event = events_by_key.get(event_id)
-        if event is None:
-            home_team, _, away_team = str(
-                row.get("home_team") or event_name
-            ).partition(" @ ")
-            away = row.get("away_team") or (away_team or None)
-            events_by_key[event_id] = {
-                "id": event_id,
-                "sport_key": row.get("sport_key") or row.get("sport") or "",
-                "sport_title": (
-                    (row.get("league_ref") or {}).get("label")
-                    or row.get("league")
-                    or ""
-                ),
-                "commence_time": (
-                    row.get("event_start_time")
-                    or row.get("start_time")
-                    or row.get("commence_time")
-                    or ""
-                ),
-                "home_team": row.get("home_team") or home_team or "Unknown",
-                "away_team": row.get("away_team") or away or "Unknown",
-                "bookmakers": [],
-            }
-            event = events_by_key[event_id]
-        market_key = _SHARPAPI_MARKET_ALIASES.get(
-            str(row.get("market_type", "")).lower(), ""
-        )
-        if not market_key:
-            continue
-        book_key = str(
-            row.get("book") or row.get("bookmaker")
-            or row.get("sportsbook") or "unknown"
-        )
-        bookmaker = next(
-            (b for b in event["bookmakers"] if b["key"] == book_key), None
-        )
-        if bookmaker is None:
-            bookmaker = {"key": book_key, "title": book_key, "markets": []}
-            event["bookmakers"].append(bookmaker)
-        market = next(
-            (m for m in bookmaker["markets"] if m["key"] == market_key), None
-        )
-        if market is None:
-            market = {"key": market_key, "outcomes": []}
-            bookmaker["markets"].append(market)
-        price = _decimal_price(
-            row.get("price")
-            if row.get("price") is not None
-            else (row.get("odds") if row.get("odds") is not None else row.get("odds_decimal"))
-        )
-        selection = row.get("selection") or row.get("name")
-        point = (
-            row.get("point") if row.get("point") is not None else row.get("line")
-        )
-        if selection is None or price is None:
-            continue
-        outcome = {"name": str(selection), "price": price}
-        if point is not None:
-            try:
-                outcome["point"] = float(point)
-            except (TypeError, ValueError):
-                pass
-        market["outcomes"].append(outcome)
-    return list(events_by_key.values())
+    return price if price > 1.0 else None
 
 
 def _american_to_decimal(raw) -> float | None:
-    """Convert an American odds string ("+133"/"-139") to decimal odds."""
+    """Convert American odds ("+133" / "-139" / 150) to decimal odds."""
     if raw is None:
         return None
     try:
-        a = float(str(raw).strip().replace("+", ""))
+        value = float(str(raw).strip().replace("+", ""))
     except (TypeError, ValueError):
         return None
-    if a >= 100:
-        return round(1 + a / 100, 4)
-    if a <= -100:
-        return round(1 + 100 / abs(a), 4)
+    if value >= 100:
+        return round(1 + value / 100, 4)
+    if value <= -100:
+        return round(1 + 100 / abs(value), 4)
     return None
 
 
 def _parse_line(raw) -> float | None:
-    """Parse a spread/total line value ("+1.5"/"-1.5"/"3.5") as a float."""
+    """Parse a spread/total line ("+1.5" / "-1.5" / 3.5) as a float."""
     if raw is None:
         return None
     try:
@@ -456,443 +526,373 @@ def _parse_line(raw) -> float | None:
         return None
 
 
-def _normalize_sgo_events(events) -> list[dict]:
-    """
-    Rebuild the-odds-api-style events from a SportsGameOdds /v2/events
-    payload (verified live, Sept 2026):
+def _add_outcome(event: dict, book: str, market_key: str, outcome: dict) -> None:
+    """Insert an outcome, replacing an earlier one with the same name."""
+    bookmaker = next((b for b in event["bookmakers"] if b["key"] == book), None)
+    if bookmaker is None:
+        bookmaker = {"key": book, "title": book, "markets": []}
+        event["bookmakers"].append(bookmaker)
+    market = next((m for m in bookmaker["markets"] if m["key"] == market_key), None)
+    if market is None:
+        market = {"key": market_key, "outcomes": []}
+        bookmaker["markets"].append(market)
+    market["outcomes"] = [
+        o for o in market["outcomes"] if o["name"] != outcome["name"]
+    ] + [outcome]
 
-      event = {
-        "eventID": ..., "status": {"started": false, "live": false,
-        "startsAt": "2026-10-13T16:45:00.000Z", ...},
-        "teams": {"home": {"names": {"long": "RC Lens", ...}}, ...},
-        "odds": {
-          "points-all-reg-ml3way-home": {
-            "statID": "points", "statEntityID": "home", "periodID": "reg",
-            "betTypeID": "ml3way", "sideID": "home",
-            "byBookmaker": {"fanduel": {"odds": "+133", "available": true,
-                             "spread": "-1.5", "overUnder": "3.5", ...}},
-          }, ...
-        }
-      }
 
-    Soccer 1X2 lives at periodID "reg" (regulation); totals also exist at
-    "game". When both periods offer the same bet type, "reg" wins so the
-    same market key never mixes two different lines. Live/ended/cancelled
-    events are excluded (pre-match bot). Combined ml3way sides
-    (home+draw / not_draw) are skipped — the pipeline expects single-sided
-    outcomes only.
+# ---------------------------------------------------------------------------
+# Provider 2: SharpAPI
+# ---------------------------------------------------------------------------
+
+def _normalize_sharpapi_rows(rows: list) -> list[dict]:
     """
-    events_out: list[dict] = []
+    Rebuild The Odds API style events from SharpAPI /odds rows.
+
+    Each row is one (event, market, selection, sportsbook) price, e.g.
+    {"event_id": "33483153", "sport": "soccer", "league": "england_-_premier_league",
+     "home_team": ..., "away_team": ..., "market_type": "moneyline",
+     "selection": "Arsenal", "selection_type": "home", "odds_decimal": 1.67,
+     "line": null, "sportsbook": "draftkings", "is_main_line": true,
+     "is_live": false, "event_start_time": "2026-01-26T19:00:00Z"}.
+    Live rows and alternate lines are dropped.
+    """
+    events: dict[str, dict] = {}
+    for row in rows if isinstance(rows, list) else []:
+        if not isinstance(row, dict) or row.get("is_live"):
+            continue
+        if row.get("is_alternate_line") or row.get("is_main_line") is False:
+            continue
+        market_key = _SHARPAPI_MARKETS.get(str(row.get("market_type", "")).lower())
+        event_id = str(row.get("event_id") or "").strip()
+        home = str(row.get("home_team") or "").strip()
+        away = str(row.get("away_team") or "").strip()
+        if not market_key or not event_id or not home or not away:
+            continue
+        price = (
+            _decimal_price(row.get("odds_decimal"))
+            or _decimal_price(row.get("odds"))
+            or _american_to_decimal(row.get("odds_american"))
+        )
+        if price is None:
+            continue
+        side = str(row.get("selection_type") or "").lower()
+        name = {
+            "home": home, "away": away, "draw": "Draw", "over": "Over", "under": "Under",
+        }.get(side) or str(row.get("selection") or "").strip()
+        if name.lower() in {"draw", "tie", "x"}:
+            name = "Draw"
+        if not name:
+            continue
+
+        event = events.get(event_id)
+        if event is None:
+            event = events[event_id] = {
+                "id": f"{PROVIDER_SHARPAPI}:{event_id}",
+                "source": PROVIDER_SHARPAPI,
+                "provider_league": f"{row.get('sport') or ''}/{row.get('league') or ''}",
+                "home_team": home,
+                "away_team": away,
+                "commence_time": str(row.get("event_start_time") or row.get("start_time") or ""),
+                "bookmakers": [],
+            }
+        outcome = {"name": name, "price": price}
+        line = _parse_line(row.get("line"))
+        if market_key != "h2h" and line is not None:
+            outcome["point"] = line
+        book = str(row.get("sportsbook") or row.get("book") or row.get("bookmaker") or "unknown")
+        _add_outcome(event, book, market_key, outcome)
+    return list(events.values())
+
+
+def _fetch_from_sharpapi(sport_keys: list[str]) -> tuple[dict, str | None]:
+    """Fetch every mapped league in one paginated SharpAPI /odds request."""
+    wanted: dict[str, str] = {}   # "sport/league" -> first requested sport key
+    for sport_key in sport_keys:
+        target = _provider_league(sport_key, _SHARPAPI_LEAGUES)
+        if target and target not in wanted:
+            wanted[target] = sport_key
+    if not wanted:
+        return {}, "none of the remaining leagues are covered"
+
+    params = {
+        "sport": ",".join(sorted({target.split("/")[0] for target in wanted})),
+        "league": ",".join(target.split("/", 1)[1] for target in wanted),
+        "market": ",".join(_SHARPAPI_MARKETS),
+        "is_live": "false",
+        "limit": 200,
+    }
+    rows, error = _get_paginated(
+        PROVIDER_SHARPAPI,
+        f"{config.SHARPAPI_BASE_URL.rstrip('/')}/odds",
+        params,
+        {"X-API-Key": config.SHARPAPI_API_KEY},
+        lambda body: (body.get("pagination") or {}).get("next_cursor"),
+    )
+    answered: dict[str, list] = {}
+    for event in _normalize_sharpapi_rows(rows):
+        target = event["provider_league"]
+        if target not in wanted and len(wanted) == 1:
+            target = next(iter(wanted))
+        sport_key = wanted.get(target)
+        if sport_key:
+            answered.setdefault(sport_key, []).append(event)
+    if not answered and not error:
+        error = "no odds returned for the requested leagues"
+    return answered, error
+
+
+# ---------------------------------------------------------------------------
+# Provider 3: SportsGameOdds
+# ---------------------------------------------------------------------------
+
+def _sgo_team_name(team) -> str | None:
+    if not isinstance(team, dict):
+        return None
+    names = team.get("names") or {}
+    return names.get("long") or names.get("medium") or names.get("short") or team.get("name")
+
+
+def _normalize_sgo_events(events: list) -> list[dict]:
+    """
+    Rebuild The Odds API style events from a SportsGameOdds /v2/events payload.
+
+    Odds live at event["odds"][oddID], where oddID is
+    statID-statEntityID-periodID-betTypeID-sideID (e.g.
+    "points-home-reg-ml3way-home", "points-all-reg-ou-over"), with prices per
+    bookmaker in byBookmaker (American odds, per-book spread/overUnder lines).
+    Full-match "points" markets only: regulation time ("reg") is preferred
+    over "game" per bet type, and the 3-way moneyline replaces the 2-way one
+    when both exist. Started, live, finished or cancelled events are dropped.
+    """
+    normalized: list[dict] = []
     for ev in events if isinstance(events, list) else []:
         if not isinstance(ev, dict):
             continue
         status = ev.get("status") or {}
-        if (status.get("started") or status.get("live")
-                or status.get("ended") or status.get("cancelled")
-                or status.get("completed")):
+        if any(status.get(flag) for flag in
+               ("started", "live", "ended", "completed", "cancelled", "finalized")):
             continue
         teams = ev.get("teams") or {}
-        home_names = (teams.get("home") or {}).get("names") or {}
-        away_names = (teams.get("away") or {}).get("names") or {}
-        home_name = home_names.get("long") or home_names.get("medium")
-        away_name = away_names.get("long") or away_names.get("medium")
-        if not home_name or not away_name:
+        home = _sgo_team_name(teams.get("home"))
+        away = _sgo_team_name(teams.get("away"))
+        if not home or not away:
             continue
 
-        # First pass: bucket full-game entries by (betTypeID, sideID) so a
-        # "reg" entry always beats a "game" entry for the same market.
-        buckets: dict[tuple, dict] = {}
-        for entry in (ev.get("odds") or {}).values():
-            if not isinstance(entry, dict):
-                continue
-            bet = entry.get("betTypeID")
-            if bet not in ("ml", "ml3way", "sp", "ou"):
-                continue
-            period = entry.get("periodID")
-            if period not in ("game", "reg"):
-                continue
-            if entry.get("statEntityID") not in ("home", "away", "all"):
-                continue
-            side = entry.get("sideID")
-            if side in ("home+draw", "away+draw", "not_draw"):
-                continue  # combined sides — not pipeline outcomes
-            key = (bet, side)
-            existing = buckets.get(key)
-            if existing is None or period == "reg":
-                buckets[key] = entry
+        entries = [
+            entry for entry in (ev.get("odds") or {}).values()
+            if isinstance(entry, dict)
+            and entry.get("statID") == "points"
+            and entry.get("statEntityID") in ("home", "away", "all")
+            and entry.get("betTypeID") in ("ml", "ml3way", "sp", "ou")
+            and entry.get("periodID") in ("game", "reg")
+            and entry.get("sideID") in ("home", "away", "draw", "over", "under")
+        ]
+        has_three_way = any(e.get("betTypeID") == "ml3way" for e in entries)
+        periods = {
+            bet: "reg" if any(e["betTypeID"] == bet and e["periodID"] == "reg" for e in entries)
+            else "game"
+            for bet in {e["betTypeID"] for e in entries}
+        }
 
-        bookmakers: dict[str, dict] = {}
-        for (bet, side), entry in buckets.items():
+        event = {
+            "id": f"{PROVIDER_SPORTSGAMEODDS}:{ev.get('eventID') or ''}",
+            "source": PROVIDER_SPORTSGAMEODDS,
+            "provider_league": str(ev.get("leagueID") or ""),
+            "home_team": home,
+            "away_team": away,
+            "commence_time": str(status.get("startsAt") or ""),
+            "bookmakers": [],
+        }
+        for entry in entries:
+            bet, side = entry["betTypeID"], entry["sideID"]
+            if entry["periodID"] != periods[bet] or (bet == "ml" and has_three_way):
+                continue
             if bet in ("ml", "ml3way"):
                 market_key = "h2h"
-                outcome_name = (
-                    "Draw" if side == "draw"
-                    else home_name if side == "home"
-                    else away_name if side == "away"
-                    else None
-                )
-                point = None
+                name = {"home": home, "away": away, "draw": "Draw"}.get(side)
             elif bet == "sp":
                 market_key = "spreads"
-                outcome_name = home_name if side == "home" else (
-                    away_name if side == "away" else None
-                )
-                point = _parse_line(entry.get("spread"))
-            else:  # ou
+                name = {"home": home, "away": away}.get(side)
+            else:
                 market_key = "totals"
-                outcome_name = "Over" if side == "over" else (
-                    "Under" if side == "under" else None
-                )
-                point = _parse_line(entry.get("overUnder"))
-            if outcome_name is None:
+                name = {"over": "Over", "under": "Under"}.get(side)
+            if name is None:
                 continue
-            for book_id, row in (entry.get("byBookmaker") or {}).items():
-                if not isinstance(row, dict) or row.get("available") is not True:
+            for book, quote in (entry.get("byBookmaker") or {}).items():
+                if not isinstance(quote, dict) or quote.get("available") is False:
                     continue
-                price = _american_to_decimal(row.get("odds"))
+                price = _american_to_decimal(quote.get("odds"))
                 if price is None:
                     continue
-                # Spread/total lines are per-bookmaker fields in SGO.
-                line = (_parse_line(row.get("spread")) if bet == "sp"
-                        else _parse_line(row.get("overUnder")) if bet == "ou"
-                        else None)
-                bookmaker = bookmakers.get(book_id)
-                if bookmaker is None:
-                    bookmaker = {"key": book_id, "title": book_id,
-                                 "markets": []}
-                    bookmakers[book_id] = bookmaker
-                market = next(
-                    (m for m in bookmaker["markets"] if m["key"] == market_key),
-                    None,
+                outcome = {"name": name, "price": price}
+                line = (
+                    _parse_line(quote.get("spread")) if bet == "sp"
+                    else _parse_line(quote.get("overUnder")) if bet == "ou"
+                    else None
                 )
-                if market is None:
-                    market = {"key": market_key, "outcomes": []}
-                    bookmaker["markets"].append(market)
-                outcome = {"name": outcome_name, "price": price}
                 if line is not None:
                     outcome["point"] = line
-                market["outcomes"].append(outcome)
-
-        if not bookmakers:
-            continue
-        events_out.append({
-            "id": str(ev.get("eventID") or ""),
-            "sport_key": str(ev.get("sportID") or "").lower(),
-            "sport_title": str(ev.get("leagueID") or ""),
-            "commence_time": str(status.get("startsAt") or ""),
-            "home_team": home_name,
-            "away_team": away_name,
-            "bookmakers": list(bookmakers.values()),
-        })
-    return events_out
+                _add_outcome(event, str(book), market_key, outcome)
+        if event["bookmakers"] and ev.get("eventID"):
+            normalized.append(event)
+    return normalized
 
 
-def _normalize_provider_response(provider: dict, payload) -> list[dict]:
-    """
-    Convert a provider's raw JSON body into a the-odds-api-style events list.
-    the-odds-api-style providers already return that shape; SharpAPI's flat
-    "data" rows need to be rebuilt into events.
-    """
-    wrapper = provider.get("response_wrapper")
-    if provider.get("sport_key_style") == "sgo":
-        data = payload.get("data") if isinstance(payload, dict) else None
-        return _normalize_sgo_events(data)
-    if wrapper is None:
-        return payload if isinstance(payload, list) else []
-    rows = payload.get(wrapper) if isinstance(payload, dict) else None
-    return _normalize_sharpapi_rows(rows)
+def _fetch_from_sportsgameodds(sport_keys: list[str]) -> tuple[dict, str | None]:
+    """Fetch today's events for every mapped league in one paginated request."""
+    wanted: dict[str, str] = {}   # leagueID -> first requested sport key
+    for sport_key in sport_keys:
+        league_id = _provider_league(sport_key, _SPORTSGAMEODDS_LEAGUES)
+        if league_id and league_id not in wanted:
+            wanted[league_id] = sport_key
+    if not wanted:
+        return {}, "none of the remaining leagues are covered"
+
+    now = datetime.now(timezone.utc)
+    end_of_day = datetime.now(LAGOS_TZ).replace(
+        hour=23, minute=59, second=59, microsecond=0
+    ).astimezone(timezone.utc)
+    params = {
+        "apiKey": config.SPORTSGAMEODDS_API_KEY,
+        "leagueID": ",".join(wanted),
+        "oddsAvailable": "true",
+        # Only today's upcoming matches: the free tier counts every event returned.
+        "startsAfter": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "startsBefore": end_of_day.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "limit": 50,
+    }
+    raw_events, error = _get_paginated(
+        PROVIDER_SPORTSGAMEODDS,
+        f"{config.SPORTSGAMEODDS_BASE_URL.rstrip('/')}/events",
+        params,
+        {},
+        lambda body: body.get("nextCursor"),
+    )
+    answered: dict[str, list] = {}
+    for event in _normalize_sgo_events(raw_events):
+        sport_key = wanted.get(event["provider_league"])
+        if sport_key:
+            answered.setdefault(sport_key, []).append(event)
+    if not answered and not error:
+        error = "no odds returned for the requested leagues"
+    return answered, error
 
 
-def _fetch_single_sport_from_provider(
-    sport_key: str, provider: dict, api_key: str
-) -> tuple:
-    """
-    Fetch odds for a single sport key from a specific provider.
-    Returns (sport_key, events_list) or (sport_key, None) on failure.
+# ---------------------------------------------------------------------------
+# Failover orchestration
+# ---------------------------------------------------------------------------
 
-    Failure classification:
-      * 200 with usable odds -> success; cooldown cleared (healthy again).
-      * 200 with no usable odds / malformed JSON -> schema problem; NO retry.
-      * 401 / 429 -> auth / quota; marked dead for the daily cycle (no retry).
-      * 403 / 404 -> permission / endpoint problem; NO retry.
-      * 408, 5xx, timeouts, connection errors -> transient; retried with
-        backoff (0s, 1s, 3s). If every attempt fails, the provider enters a
-        short auto-expiring cooldown so later sports skip it.
-    """
-    provider_name = provider["name"]
-    url, params, headers = _build_provider_request(sport_key, provider, api_key)
-
-    for attempt, backoff in enumerate((0.0, 1.0, 3.0)):
-        if backoff:
-            time.sleep(backoff)
-        try:
-            resp = requests.get(
-                url,
-                params=params,
-                headers=headers,
-                timeout=config.ODDS_API_TIMEOUT_SECONDS,
-            )
-
-            if resp.status_code == 200:
-                try:
-                    payload = resp.json()
-                except ValueError:
-                    logger.warning(
-                        "[ODDS] %s returned malformed JSON for %s "
-                        "(schema problem, not retrying)",
-                        provider_name, sport_key,
-                    )
-                    return sport_key, None
-                events = _normalize_provider_response(provider, payload)
-                if not events:
-                    logger.warning(
-                        "[ODDS] %s returned 200 for %s but no usable odds "
-                        "(empty/unparseable response, not retrying)",
-                        provider_name, sport_key,
-                    )
-                    return sport_key, None
-                logger.info(
-                    "[ODDS] %s returned %d usable events for %s",
-                    provider_name, len(events), sport_key,
-                )
-                _record_quota(resp.headers, sport_key, True)
-                _clear_cooldown(provider_name)
-                return sport_key, events
-
-            elif resp.status_code == 401:
-                logger.warning(
-                    "[ODDS] %s AUTH FAILED for %s (HTTP 401) — not retrying",
-                    provider_name, sport_key,
-                )
-                _mark_provider_dead(provider_name)
-                return sport_key, None
-
-            elif resp.status_code == 403:
-                logger.warning(
-                    "[ODDS] %s PERMISSION DENIED for %s (HTTP 403) — "
-                    "not retrying", provider_name, sport_key,
-                )
-                return sport_key, None
-
-            elif resp.status_code == 404:
-                logger.warning(
-                    "[ODDS] %s ENDPOINT NOT FOUND for %s (HTTP 404) — "
-                    "not retrying", provider_name, sport_key,
-                )
-                return sport_key, None
-            elif resp.status_code == 429:
-                # Respect a short Retry-After; otherwise treat as quota
-                # exhaustion for today and stop hammering.
-                retry_after = resp.headers.get("retry-after")
-                try:
-                    wait_s = float(retry_after) if retry_after else None
-                except (TypeError, ValueError):
-                    wait_s = None
-                if wait_s is not None and 0 < wait_s <= 5 and attempt < 2:
-                    logger.info(
-                        "[ODDS] %s rate limited (429) for %s — retrying "
-                        "after %.0fs per Retry-After",
-                        provider_name, sport_key, wait_s,
-                    )
-                    time.sleep(wait_s)
-                    continue
-                logger.warning(
-                    "[ODDS] %s RATE LIMITED for %s (HTTP 429) — marking "
-                    "dead for today", provider_name, sport_key,
-                )
-                _record_quota(resp.headers, sport_key, False)
-                _mark_provider_dead(provider_name)
-                return sport_key, None
-
-            elif resp.status_code in (408, 500, 502, 503, 504):
-                # Transient server problem — retry with backoff.
-                logger.warning(
-                    "[ODDS] %s returned HTTP %d for %s (attempt %d/3) — "
-                    "transient, may retry",
-                    provider_name, resp.status_code, sport_key, attempt + 1,
-                )
-                continue
-
-            else:
-                logger.warning(
-                    "[ODDS] %s returned HTTP %d for %s — not retrying",
-                    provider_name, resp.status_code, sport_key,
-                )
-                return sport_key, None
-
-        except requests.exceptions.SSLError as e:
-            logger.warning(
-                "[ODDS] %s TLS/SSL failure for %s: %s",
-                provider_name, sport_key, str(e)[:160],
-            )
-            break   # TLS problems are rarely transient — skip the retries
-
-        except requests.exceptions.Timeout:
-            logger.warning(
-                "[ODDS] %s request timed out for %s (attempt %d/3)",
-                provider_name, sport_key, attempt + 1,
-            )
-            continue
-
-        except requests.exceptions.ConnectionError as e:
-            logger.warning(
-                "[ODDS] %s connection failed for %s (attempt %d/3): %s",
-                provider_name, sport_key, attempt + 1, str(e)[:160],
-            )
-            continue
-
-        except requests.RequestException as e:
-            logger.warning(
-                "[ODDS] %s request failed for %s: %s",
-                provider_name, sport_key, str(e)[:200],
-            )
-            break
-
-        except ValueError as e:
-            logger.warning(
-                "[ODDS] %s unexpected response for %s: %s",
-                provider_name, sport_key, str(e)[:160],
-            )
-            return sport_key, None
-
-    # Every attempt failed with a transient problem — cool the provider down
-    # so the remaining sport fetches skip it instead of hammering it.
-    _start_cooldown(provider_name)
-    return sport_key, None
+def _providers() -> dict[str, tuple[Callable[[list[str]], tuple[dict, str | None]], bool]]:
+    """name -> (fetch function, whether an API key is configured)."""
+    return {
+        PROVIDER_ODDS_API: (_fetch_from_odds_api, bool(_api_key())),
+        PROVIDER_SHARPAPI: (_fetch_from_sharpapi, bool(config.SHARPAPI_API_KEY)),
+        PROVIDER_SPORTSGAMEODDS: (
+            _fetch_from_sportsgameodds, bool(config.SPORTSGAMEODDS_API_KEY),
+        ),
+    }
 
 
-def _fetch_single_sport(sport_key: str) -> tuple:
-    """
-    Fetch odds for a single sport key, trying providers in order:
-    The Odds API -> SportGameOdds -> SharpAPI. A provider is skipped when it
-    is marked dead for the daily cycle (401/429) or inside its short
-    auto-expiring cooldown (transient outage). A provider that returns usable
-    odds wins outright — providers are NOT merged, and we do not fall through
-    merely because one optional market is missing.
-    """
-    for provider in config.ODDS_API_PROVIDERS:
-        if _is_provider_dead(provider["name"]):
-            logger.info(
-                "[ODDS] Skipping %s (marked dead for today)", provider["name"]
-            )
-            continue
-        if _cooldown_active(provider["name"]):
-            logger.info("[ODDS] Skipping %s (in cooldown)", provider["name"])
-            continue
-        api_key = _provider_key(provider)
-        if not api_key:
-            continue
-        logger.info("[ODDS] Trying %s for %s", provider["name"], sport_key)
-        key, events = _fetch_single_sport_from_provider(
-            sport_key, provider, api_key
-        )
-        if events:
-            logger.info("[ODDS] Active provider: %s", provider["name"])
-            return key, events
-        logger.info("[ODDS] Falling back from %s", provider["name"])
-
-    logger.warning("[ODDS] All providers failed for %s", sport_key)
-    return sport_key, None
+def provider_configured(name: str) -> bool:
+    """Whether a provider has an API key set."""
+    return _providers().get(name, (None, False))[1]
 
 
 def _fetch_all_sports_odds() -> dict:
     """
-    Fetch odds for all configured sports from the API concurrently.
-    Called only once per day (Lagos time) when the cache is first populated.
-    Returns a dict mapping sport_key -> list of events.
+    Fetch today's odds for every configured league, failing over between
+    providers. Called once per Lagos day when the cache is first populated.
+    Returns a dict mapping sport_key -> list of events (empty when no provider
+    had data for that league).
 
-    Raises OddsAPIError when EVERY sport failed (e.g. invalid API key or
-    quota exhausted) so the caller does not mistake a total outage for a
-    legitimately empty match day.
-
-    Uses ThreadPoolExecutor for concurrent requests — fetches up to 4 sports
-    simultaneously, reducing total fetch time from ~13s to ~4s for 13 sports.
+    Raises OddsAPIError when no provider could answer any league, so the
+    caller does not mistake a total outage for an empty match day.
     """
-    # Import here to avoid circular imports at module load time
-    from predictions import SPORT_KEY_MAP
+    sport_keys, odds_api_problem = _resolve_fetch_plan()
+    sports_data: dict[str, list] = {sport_key: [] for sport_key in sport_keys}
+    pending = list(sport_keys)
+    report: dict = {
+        "at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "providers": {},
+        "sources": {},
+    }
+    registry = _providers()
 
-    # A new daily fetch means a fresh chance for every provider — clear any
-    # 401/429 marks and transient cooldowns from the previous day's fetch.
-    _reset_dead_providers()
-    _reset_cooldowns()
+    for name in config.ODDS_PROVIDER_ORDER:
+        if name not in registry:
+            logger.warning("[ODDS] Unknown provider %r in ODDS_PROVIDER_ORDER", name)
+            continue
+        fetch, configured = registry[name]
+        entry = {"configured": configured, "attempted": 0, "answered": 0, "error": None}
+        report["providers"][name] = entry
+        if not pending:
+            continue
+        if not configured:
+            entry["error"] = "API key not set"
+            continue
+        if name == PROVIDER_ODDS_API and odds_api_problem:
+            entry["error"] = odds_api_problem
+            continue
 
-    # Collect all unique sport keys from the predictions config
-    all_sport_keys = []
-    for sport_name, leagues in SPORT_KEY_MAP.items():
-        for league in leagues:
-            key = league["key"]
-            if key not in all_sport_keys:
-                all_sport_keys.append(key)
+        entry["attempted"] = len(pending)
+        logger.info("[ODDS] Trying %s for %d league(s)", name, len(pending))
+        try:
+            answered, error = fetch(pending)
+        except Exception as exc:  # noqa: BLE001 — one provider's bug must not break failover
+            logger.exception("[ODDS] %s crashed while fetching odds", name)
+            answered, error = {}, f"unexpected error: {exc}"
+        entry["answered"] = len(answered)
+        entry["error"] = error
+        for sport_key, events in answered.items():
+            sports_data[sport_key] = events
+            report["sources"][sport_key] = name
+        pending = [key for key in pending if key not in answered]
+        if error:
+            logger.warning(
+                "[ODDS] %s answered %d league(s); %d left (%s)",
+                name, len(answered), len(pending), error,
+            )
 
-    # Keep failed sports in the cache as empty lists so they are not retried
-    # by later user requests on the same day.
-    sports_data = {sport_key: [] for sport_key in all_sport_keys}
+    _last_fetch_report.clear()
+    _last_fetch_report.update(report)
 
-    # Fetch sports concurrently using ThreadPoolExecutor
-    with ThreadPoolExecutor(max_workers=_MAX_WORKERS) as executor:
-        future_to_key = {
-            executor.submit(_fetch_single_sport, sport_key): sport_key
-            for sport_key in all_sport_keys
-        }
-
-        for future in as_completed(future_to_key):
-            sport_key = future_to_key[future]
-            try:
-                _, events = future.result()
-            except (AttributeError, KeyError, TypeError, ValueError) as exc:
-                logger.warning("Unexpected response for %s: %s", sport_key, exc)
-                events = None
-            if events is not None:
-                sports_data[sport_key] = events
-
-    succeeded = sum(1 for events in sports_data.values() if events)
-    if succeeded == 0:
-        raise OddsAPIError(
-            "All sport fetches failed — likely an invalid ODDS_API_KEY (401) "
-            "or exhausted API quota (429). Not caching this empty result."
+    if sport_keys and not report["sources"]:
+        problems = "; ".join(
+            f"{name}: {entry['error']}"
+            for name, entry in report["providers"].items() if entry["error"]
         )
+        raise OddsAPIError(f"No odds provider could supply data ({problems})")
 
     total_events = sum(len(events) for events in sports_data.values())
-    regions = len(config.ODDS_REGIONS.split(","))
-    markets = len(config.ODDS_MARKETS.split(","))
-    credits_used = regions * markets * len(all_sport_keys)
+    by_provider = Counter(report["sources"].values())
     logger.info(
-        "Fetched odds summary: %d/%d sports returned data, "
-        "%d total raw matches. Credit cost: %d regions x %d markets x "
-        "%d leagues = %d credits this fetch.",
-        succeeded, len(all_sport_keys), total_events,
-        regions, markets, len(all_sport_keys), credits_used,
+        "[ODDS] Daily fetch: %d/%d leagues answered (%s), %d raw matches%s",
+        len(report["sources"]), len(sport_keys),
+        ", ".join(f"{name}: {count}" for name, count in by_provider.items()),
+        total_events,
+        f"; no data for {', '.join(pending)}" if pending else "",
     )
     return sports_data
 
 
-def get_sports():
-    """Return the list of all sport keys currently in season."""
-    resp = requests.get(
-        f"{BASE_URL}/sports",
-        params={"apiKey": _api_key()},
-        timeout=15,
-    )
-    if resp.status_code != 200:
-        raise OddsAPIError(
-            f"Failed to fetch sports list: {resp.status_code} {resp.text}"
-        )
-    return resp.json()
-
-
-def get_odds(sport_key, markets="h2h"):
+def get_odds(sport_key: str, markets: str | None = None) -> list[dict]:
     """
-    Fetch current odds for a sport.
-    markets: 'h2h' (moneyline/win-draw-win), 'spreads', or 'totals'
-    Returns a list of events, each with bookmaker odds.
+    Return today's events (with bookmaker odds) for one sport.
 
     Uses the shared daily cache — only the first request of the day
-    (Africa/Lagos time) triggers API calls. All subsequent calls
-    (pagination, other users, stats) read from the cached dataset.
+    (Africa/Lagos time) triggers API calls. All subsequent calls (pagination,
+    other users, stats) read from the cached dataset. ``markets`` is accepted
+    for backward compatibility; the fetched markets come from config.
+    Raises OddsAPIError if the daily fetch failed.
     """
-    # Ensure the daily cache is populated (thread-safe, only fetches once per day)
     sports_data = ensure_populated(_fetch_all_sports_odds)
 
     # The dated cache is authoritative for the entire day. Missing keys mean
     # that sport failed or had no data during the daily fetch; do not retry it.
     return sports_data.get(sport_key, [])
+
+
+def get_cached_sport_keys() -> list[str]:
+    """Sport keys in today's dataset (fetching it if needed)."""
+    return list(ensure_populated(_fetch_all_sports_odds).keys())

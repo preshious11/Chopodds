@@ -5,13 +5,18 @@ Key idea: raw decimal odds always imply MORE than 100% total probability,
 because that gap (the "overround" or "vig") is the bookmaker's margin.
 We strip that out before treating the number as a real probability.
 
-Also provides derived market calculations for markets not directly offered
-by the API but computable from available odds:
-- Double Chance (1X, 12, X2) from h2h
-- Both Teams to Score (BTTS) from totals market
+Also provides derived market calculations for markets not offered on the
+featured-odds feeds but computable from available odds:
+- Double Chance (1X, X2, 12) from h2h
+- Both Teams to Score (BTTS) from a Poisson goal model fitted to the
+  totals and h2h markets
 """
 
-from collections import defaultdict
+import math
+from collections import Counter, defaultdict
+
+# Goals per team considered by the Poisson model; P(> 10 goals) is negligible.
+_MAX_GOALS = 10
 
 
 def decimal_to_implied(odds: float) -> float:
@@ -31,10 +36,58 @@ def devig_outcomes(raw_probs: dict[str, float]) -> dict[str, float]:
     return {name: p / total for name, p in raw_probs.items()}
 
 
+def _line_signature(market: dict) -> tuple:
+    """Identify the line a bookmaker quotes, e.g. (("Over", "2.5"), ("Under", "2.5"))."""
+    return tuple(sorted(
+        (str(outcome.get("name")), str(outcome.get("point")))
+        for outcome in market.get("outcomes", [])
+    ))
+
+
+def main_line_markets(event: dict, market: str) -> list[dict]:
+    """
+    Return each bookmaker's entry for `market`, keeping only the main line.
+
+    Bookmakers often quote different lines for the same match (Over 2.5 vs
+    Over 3.5, Arsenal -1 vs Arsenal -1.5). Probabilities and prices for
+    different lines must never be mixed, so only bookmakers quoting the most
+    common line are kept. Markets without points (h2h) share one signature,
+    so nothing is dropped for them.
+    """
+    quoted = []
+    for bookmaker in event.get("bookmakers", []):
+        for mkt in bookmaker.get("markets", []):
+            if mkt.get("key") == market:
+                quoted.append(mkt)
+                break  # Only one market per bookmaker per type
+    if not quoted:
+        return []
+    main_line = Counter(_line_signature(mkt) for mkt in quoted).most_common(1)[0][0]
+    return [mkt for mkt in quoted if _line_signature(mkt) == main_line]
+
+
+def best_price_and_point(
+    event: dict, market: str, outcome_name: str
+) -> tuple[float | None, float | None]:
+    """Best available decimal price and the line for an outcome on the main line."""
+    best_price = None
+    point = None
+    for mkt in main_line_markets(event, market):
+        for outcome in mkt.get("outcomes", []):
+            if outcome.get("name") != outcome_name:
+                continue
+            price = outcome.get("price")
+            if isinstance(price, (int, float)) and (best_price is None or price > best_price):
+                best_price = price
+            point = outcome.get("point")
+    return best_price, point
+
+
 def consensus_probabilities(event: dict, market: str = "h2h") -> dict[str, dict]:
     """
-    Given one event from the Odds API response, compute the de-vigged
-    probability for each outcome, averaged across every bookmaker offering it.
+    Given one event from the odds feed, compute the de-vigged probability for
+    each outcome, averaged across every bookmaker quoting the main line of
+    that market.
 
     Returns: {
         outcome_name: {"probability": float, "num_bookmakers": int}
@@ -42,17 +95,18 @@ def consensus_probabilities(event: dict, market: str = "h2h") -> dict[str, dict]
     """
     outcome_probs: dict[str, list[float]] = defaultdict(list)
 
-    # Pre-filter bookmakers that have the target market to avoid nested loops
-    for bookmaker in event.get("bookmakers", []):
-        for mkt in bookmaker.get("markets", []):
-            if mkt.get("key") != market:
-                continue
-            # Convert odds to implied probabilities and devig
-            raw = {o["name"]: decimal_to_implied(o["price"]) for o in mkt.get("outcomes", [])}
-            fair = devig_outcomes(raw)
-            for name, prob in fair.items():
-                outcome_probs[name].append(prob)
-            break  # Only one market per bookmaker per type
+    for mkt in main_line_markets(event, market):
+        outcomes = mkt.get("outcomes", [])
+        raw = {}
+        for outcome in outcomes:
+            price = outcome.get("price")
+            if outcome.get("name") is None or not isinstance(price, (int, float)) or price <= 1.0:
+                break
+            raw[outcome["name"]] = decimal_to_implied(price)
+        if len(raw) != len(outcomes) or len(raw) < 2:
+            continue  # An incomplete market cannot be de-vigged
+        for name, prob in devig_outcomes(raw).items():
+            outcome_probs[name].append(prob)
 
     # Compute average probability per outcome
     return {
@@ -84,107 +138,171 @@ def calculate_combined_odds(odds_values) -> float:
     return round(product, 2) if valid else 0.0
 
 
+def _double_chance_components(event: dict) -> dict[str, tuple[str, str]]:
+    """The two h2h outcomes each Double Chance selection covers (standard notation)."""
+    home = event.get("home_team", "")
+    away = event.get("away_team", "")
+    return {"1X": (home, "Draw"), "X2": ("Draw", away), "12": (home, away)}
+
+
 def calculate_double_chance_probabilities(event: dict) -> dict[str, dict]:
     """
-    Calculate Double Chance probabilities from h2h market.
-    Double Chance combines two of the three outcomes, giving higher probability.
+    Calculate Double Chance probabilities from the h2h market.
 
-    Derived from h2h probabilities:
     - "1X" (Home or Draw) = P(Home) + P(Draw)
-    - "12" (Away or Draw) = P(Away) + P(Draw)
-    - "X2" (Home or Away) = P(Home) + P(Away)
+    - "X2" (Away or Draw) = P(Away) + P(Draw)
+    - "12" (Home or Away) = P(Home) + P(Away)
 
     Returns: {outcome_name: {"probability": float, "num_bookmakers": int}}
     """
-    h2h_probs = consensus_probabilities(event, market="h2h")
-
-    home_prob = None
-    draw_prob = None
-    away_prob = None
-    num_bookmakers = 0
-
-    home_name = event.get("home_team", "")
-    away_name = event.get("away_team", "")
-
-    for name, data in h2h_probs.items():
-        if name.lower() == "draw":
-            draw_prob = data["probability"]
-            num_bookmakers = data["num_bookmakers"]
-        elif name == home_name:
-            home_prob = data["probability"]
-            if num_bookmakers == 0:
-                num_bookmakers = data["num_bookmakers"]
-        elif name == away_name:
-            away_prob = data["probability"]
-            if num_bookmakers == 0:
-                num_bookmakers = data["num_bookmakers"]
-
-    if home_prob is None or away_prob is None or draw_prob is None:
-        return {}
-
-    if num_bookmakers < 3:
-        return {}
-
-    return {
-        "1X": {
-            "probability": min(home_prob + draw_prob, 0.99),
-            "num_bookmakers": num_bookmakers,
-        },
-        "12": {
-            "probability": min(away_prob + draw_prob, 0.99),
-            "num_bookmakers": num_bookmakers,
-        },
-        "X2": {
-            "probability": min(home_prob + away_prob, 0.99),
-            "num_bookmakers": num_bookmakers,
-        },
+    h2h = {
+        name.lower(): data
+        for name, data in consensus_probabilities(event, market="h2h").items()
     }
+    result = {}
+    for code, (first, second) in _double_chance_components(event).items():
+        first_data = h2h.get(first.lower())
+        second_data = h2h.get(second.lower())
+        if first_data is None or second_data is None:
+            return {}
+        result[code] = {
+            "probability": min(first_data["probability"] + second_data["probability"], 0.99),
+            "num_bookmakers": min(first_data["num_bookmakers"], second_data["num_bookmakers"]),
+        }
+    return result
+
+
+def dutch_odds(prices: list[float | None]) -> float | None:
+    """
+    Price for backing several mutually exclusive outcomes together.
+
+    Splitting the stake in proportion to 1/price pays the same whichever
+    outcome happens, so the combined price is 1 / sum(1/price).
+    """
+    if not prices or any(price is None or price <= 1.0 for price in prices):
+        return None
+    return 1.0 / sum(1.0 / price for price in prices)
+
+
+def double_chance_odds(event: dict) -> dict[str, float]:
+    """
+    Achievable Double Chance prices built from the best available h2h prices.
+
+    Unlike 1/probability, these include the bookmakers' margin, so they are
+    what a bettor could actually get.
+    """
+    odds = {}
+    for code, names in _double_chance_components(event).items():
+        combined = dutch_odds(
+            [best_price_and_point(event, "h2h", name)[0] for name in names]
+        )
+        if combined is not None:
+            odds[code] = combined
+    return odds
+
+
+def _poisson_pmfs(rate: float, max_goals: int) -> list[float]:
+    """P(goals = k) for k in 0..max_goals under a Poisson distribution."""
+    pmfs = [math.exp(-rate)]
+    for goals in range(1, max_goals + 1):
+        pmfs.append(pmfs[-1] * rate / goals)
+    return pmfs
+
+
+def _fair_over_probability(rate: float, line: float) -> float:
+    """P(total > line) with pushes (total == line) removed, as de-vigged odds imply."""
+    over = under = 0.0
+    for goals, prob in enumerate(_poisson_pmfs(rate, _MAX_GOALS * 2)):
+        if goals > line:
+            over += prob
+        elif goals < line:
+            under += prob
+    return over / (over + under) if over + under else 0.0
+
+
+def _home_win_share(home_rate: float, away_rate: float) -> float:
+    """Home wins as a share of decisive (non-draw) results."""
+    home_pmfs = _poisson_pmfs(home_rate, _MAX_GOALS)
+    away_pmfs = _poisson_pmfs(away_rate, _MAX_GOALS)
+    home_win = away_win = 0.0
+    for home_goals, home_prob in enumerate(home_pmfs):
+        for away_goals, away_prob in enumerate(away_pmfs):
+            if home_goals > away_goals:
+                home_win += home_prob * away_prob
+            elif away_goals > home_goals:
+                away_win += home_prob * away_prob
+    return home_win / (home_win + away_win) if home_win + away_win else 0.5
+
+
+def _solve_increasing(fn, target: float, low: float, high: float) -> float:
+    """Find x in [low, high] with fn(x) == target, for an increasing fn (bisection)."""
+    for _ in range(40):
+        mid = (low + high) / 2
+        if fn(mid) < target:
+            low = mid
+        else:
+            high = mid
+    return (low + high) / 2
 
 
 def calculate_btts_probabilities(event: dict) -> dict[str, dict]:
     """
-    Calculate Both Teams to Score probabilities from the totals market.
-    Uses Over/Under 2.5 goals as a proxy:
-    - BTTS "Yes" correlates with Over 2.5 goals
-    - BTTS "No" correlates with Under 2.5 goals
+    Estimate Both Teams to Score probabilities with an independent Poisson
+    goal model (a standard football approximation):
+
+    1. Fit expected total goals to the consensus Over/Under main line.
+    2. Split them between the teams so the model's home-vs-away win balance
+       matches the consensus h2h odds (an even split if h2h is missing).
+    3. P(BTTS Yes) = P(home scores >= 1) * P(away scores >= 1).
+
+    BTTS prices are not available on the featured-odds feeds, so this is a
+    model estimate rather than a market price.
 
     Returns: {outcome_name: {"probability": float, "num_bookmakers": int}}
     """
-    totals_probs = consensus_probabilities(event, market="totals")
-
-    over_data = None
-    under_data = None
-
-    for name, data in totals_probs.items():
-        if name.lower().startswith("over"):
-            over_data = data
-        elif name.lower().startswith("under"):
-            under_data = data
-
-    if over_data is None or under_data is None:
+    totals = {
+        name.lower(): data
+        for name, data in consensus_probabilities(event, market="totals").items()
+    }
+    over = totals.get("over")
+    under = totals.get("under")
+    line = best_price_and_point(event, "totals", "Over")[1]
+    if over is None or under is None or line is None:
+        return {}
+    try:
+        line = float(line)
+    except (TypeError, ValueError):
+        return {}
+    p_over = over["probability"]
+    if not 0.0 < p_over < 1.0:
         return {}
 
-    num_bookmakers = min(over_data["num_bookmakers"], under_data["num_bookmakers"])
-    if num_bookmakers < 3:
-        return {}
+    total_rate = _solve_increasing(
+        lambda rate: _fair_over_probability(rate, line), p_over, 0.05, 10.0
+    )
 
-    over_prob = over_data["probability"]
-    under_prob = under_data["probability"]
+    share = 0.5
+    h2h = {
+        name.lower(): data
+        for name, data in consensus_probabilities(event, market="h2h").items()
+    }
+    home = h2h.get(str(event.get("home_team", "")).lower())
+    away = h2h.get(str(event.get("away_team", "")).lower())
+    if home and away and home["probability"] + away["probability"] > 0:
+        target = home["probability"] / (home["probability"] + away["probability"])
+        share = _solve_increasing(
+            lambda s: _home_win_share(total_rate * s, total_rate * (1 - s)),
+            target, 0.02, 0.98,
+        )
 
-    # BTTS Yes correlates with Over 2.5 (both teams scoring = at least 2 goals)
-    # BTTS No correlates with Under 2.5 (one/both teams failing to score)
-    btts_yes_prob = min(over_prob * 0.95, 0.99)
-    btts_no_prob = min(under_prob * 0.95, 0.99)
+    home_rate = total_rate * share
+    away_rate = total_rate - home_rate
+    btts_yes = (1 - math.exp(-home_rate)) * (1 - math.exp(-away_rate))
+    num_bookmakers = min(over["num_bookmakers"], under["num_bookmakers"])
 
     return {
-        "BTTS Yes": {
-            "probability": btts_yes_prob,
-            "num_bookmakers": num_bookmakers,
-        },
-        "BTTS No": {
-            "probability": btts_no_prob,
-            "num_bookmakers": num_bookmakers,
-        },
+        "BTTS Yes": {"probability": min(btts_yes, 0.99), "num_bookmakers": num_bookmakers},
+        "BTTS No": {"probability": min(1 - btts_yes, 0.99), "num_bookmakers": num_bookmakers},
     }
 
 

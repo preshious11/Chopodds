@@ -5,7 +5,15 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 import config
+import formatters
 import predictions
+from probability import (
+    best_price_and_point,
+    calculate_btts_probabilities,
+    calculate_double_chance_probabilities,
+    consensus_probabilities,
+    double_chance_odds,
+)
 
 
 def _future_kickoff_utc() -> str:
@@ -348,3 +356,168 @@ def test_past_matches_excluded_by_commence_time():
     for pred in result:
         assert "Future" in pred["match"]
         assert "Past" not in pred["match"]
+
+
+# ---------------------------------------------------------------------------
+# Odds math, derived markets, and the confidence rules
+# ---------------------------------------------------------------------------
+
+def _market(key, *outcomes):
+    return {"key": key, "outcomes": [dict(outcome) for outcome in outcomes]}
+
+
+def _event(*markets, bookmakers=3, home="Home", away="Away"):
+    return {
+        "home_team": home,
+        "away_team": away,
+        "bookmakers": [{"key": f"b{i}", "markets": list(markets)} for i in range(bookmakers)],
+    }
+
+
+def test_consensus_ignores_bookmakers_quoting_a_different_line():
+    main = _market(
+        "totals",
+        {"name": "Over", "price": 1.9, "point": 2.5},
+        {"name": "Under", "price": 1.9, "point": 2.5},
+    )
+    other = _market(
+        "totals",
+        {"name": "Over", "price": 1.2, "point": 1.5},
+        {"name": "Under", "price": 4.0, "point": 1.5},
+    )
+    event = {"bookmakers": [
+        {"markets": [main]}, {"markets": [main]}, {"markets": [other]},
+    ]}
+
+    probs = consensus_probabilities(event, "totals")
+
+    assert probs["Over"]["num_bookmakers"] == 2
+    assert probs["Over"]["probability"] == pytest.approx(0.5)
+    assert best_price_and_point(event, "totals", "Over") == (1.9, 2.5)
+
+
+def test_double_chance_uses_standard_codes_and_achievable_prices():
+    event = _event(_market(
+        "h2h",
+        {"name": "Home", "price": 2.0},
+        {"name": "Draw", "price": 4.0},
+        {"name": "Away", "price": 4.0},
+    ))
+
+    probs = calculate_double_chance_probabilities(event)
+    odds = double_chance_odds(event)
+
+    assert probs["1X"]["probability"] == pytest.approx(0.75)
+    assert probs["X2"]["probability"] == pytest.approx(0.50)
+    assert probs["12"]["probability"] == pytest.approx(0.75)
+    assert odds["1X"] == pytest.approx(1 / (1 / 2.0 + 1 / 4.0))
+    assert odds["X2"] == pytest.approx(2.0)
+    assert predictions._format_pick_description(
+        "double_chance", "X2", None, "Home", "Away", 0.5
+    ) == "Away or Draw"
+    assert predictions._format_pick_description(
+        "double_chance", "12", None, "Home", "Away", 0.75
+    ) == "Home or Away"
+
+
+def _totals_event(over_price, under_price):
+    return _event(_market(
+        "totals",
+        {"name": "Over", "price": over_price, "point": 2.5},
+        {"name": "Under", "price": under_price, "point": 2.5},
+    ))
+
+
+def test_btts_model_is_consistent_and_tracks_goal_expectation():
+    low = calculate_btts_probabilities(_totals_event(2.6, 1.5))
+    even = calculate_btts_probabilities(_totals_event(1.9, 1.9))
+    high = calculate_btts_probabilities(_totals_event(1.5, 2.6))
+
+    for probs in (low, even, high):
+        total = probs["BTTS Yes"]["probability"] + probs["BTTS No"]["probability"]
+        assert total == pytest.approx(1.0)
+    # 50/50 at 2.5 goals -> ~2.67 expected goals split evenly -> ~54% BTTS
+    assert even["BTTS Yes"]["probability"] == pytest.approx(0.54, abs=0.01)
+    assert low["BTTS Yes"]["probability"] < even["BTTS Yes"]["probability"]
+    assert even["BTTS Yes"]["probability"] < high["BTTS Yes"]["probability"]
+
+
+def test_btts_is_less_likely_when_one_team_dominates():
+    totals = _market(
+        "totals",
+        {"name": "Over", "price": 1.9, "point": 2.5},
+        {"name": "Under", "price": 1.9, "point": 2.5},
+    )
+    lopsided = _market(
+        "h2h",
+        {"name": "Home", "price": 1.2},
+        {"name": "Draw", "price": 7.0},
+        {"name": "Away", "price": 15.0},
+    )
+    balanced = calculate_btts_probabilities(_event(totals))
+    one_sided = calculate_btts_probabilities(_event(totals, lopsided))
+    assert one_sided["BTTS Yes"]["probability"] < balanced["BTTS Yes"]["probability"]
+
+
+def test_strong_h2h_favourite_is_not_labelled_value_pick():
+    assert predictions._format_pick_description(
+        "h2h", "Alpha FC", None, "Alpha FC", "Beta FC", 0.92
+    ) == "Alpha FC to Win"
+
+
+def test_estimated_odds_are_flagged():
+    pick = {
+        "match": "A vs B", "pick": "BTTS Yes", "odds": 1.85, "confidence": 0.54,
+        "odds_estimated": True, "sport_icon": "⚽", "match_time": "15:00",
+        "league": "Test League",
+    }
+    assert "(est.)" in formatters.format_single_prediction(pick)
+
+
+def test_displayed_confidence_is_never_rounded_into_a_higher_tier():
+    base = {"match": "A vs B", "pick": "p", "odds": 1.7, "sport_icon": "",
+            "match_time": "", "league": ""}
+    assert "57%" in formatters.format_single_prediction({**base, "confidence": 0.57})
+    assert "49%" in formatters.format_single_prediction({**base, "confidence": 0.496})
+
+
+def test_confidence_is_not_rounded_up_to_the_50_percent_floor():
+    candidate = predictions._best_candidate(
+        {"X": {"probability": 0.496, "num_bookmakers": 3}},
+        {"X": (2.0, None)},
+        "h2h", "Football", {"home_team": "X", "away_team": "Y"},
+    )
+    assert candidate["confidence"] < config.MIN_PROBABILITY
+    assert predictions.get_confidence_tier(candidate["confidence"]) == "Value Pick"
+
+
+def test_low_volume_fallback_counts_matches_not_markets(monkeypatch):
+    """2 matches reach 50% across 6 market candidates: that is still a quiet day."""
+    events = [
+        {"id": event_id, "home_team": "H", "away_team": "A",
+         "commence_time": _future_kickoff_utc(), "bookmakers": [{}]}
+        for event_id in ("q0", "q1", "q2")
+    ]
+    confidences = {
+        "q0": [("h2h", 0.55), ("totals", 0.52), ("double_chance", 0.60)],
+        "q1": [("h2h", 0.56), ("totals", 0.51), ("double_chance", 0.61)],
+        "q2": [("totals", 0.45)],
+    }
+
+    def fake_markets(event, sport_name, base):
+        return [
+            {**base, "market_type": market, "pick": f"{market} pick", "odds": 1.8,
+             "confidence": confidence, "num_bookmakers": 3}
+            for market, confidence in confidences[event["id"]]
+        ]
+
+    monkeypatch.setattr(predictions, "SPORT_KEY_MAP", {
+        "Football": [{"key": "soccer_test", "name": "Test League", "short": "T", "icon": "⚽"}],
+    })
+    monkeypatch.setattr(predictions, "get_odds", lambda sport_key, markets=None: events)
+    monkeypatch.setattr(predictions, "_evaluate_match_markets", fake_markets)
+
+    result = predictions.generate_daily_predictions()
+
+    assert "q2" in {pred["event_id"] for pred in result}
+    assert predictions.get_last_generation_stats()["fallback_applied"] is True

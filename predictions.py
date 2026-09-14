@@ -1,6 +1,7 @@
 """
 Real data generator for sports predictions.
-Fetches live odds from The Odds API and converts them to prediction format.
+Fetches live odds (The Odds API, with SharpAPI / SportsGameOdds failover) and
+converts them to prediction format.
 All predictions are strictly for the current day only (Africa/Lagos timezone).
 """
 
@@ -10,12 +11,14 @@ from datetime import date, datetime, timezone
 from zoneinfo import ZoneInfo
 
 import config
-from odds_client import get_odds, OddsAPIError
+from odds_client import OddsAPIError, get_cached_sport_keys, get_odds
 from probability import (
-    consensus_probabilities,
-    calculate_double_chance_probabilities,
+    best_price_and_point,
     calculate_btts_probabilities,
     calculate_combined_odds,
+    calculate_double_chance_probabilities,
+    consensus_probabilities,
+    double_chance_odds,
 )
 
 logger = logging.getLogger(__name__)
@@ -32,6 +35,10 @@ CONFIDENCE_HIGH = 0.70      # >= 70%: High Confidence
 CONFIDENCE_MODERATE = 0.50  # 50-69%: Moderate Confidence
 CONFIDENCE_VALUE = 0.40     # 40-49%: Value Pick (low-volume days only)
 
+# Stored confidence precision. Rounding to whole percent before comparing
+# with the floors would let a 49.6% pick pass the 50% floor.
+CONFIDENCE_DECIMALS = 4
+
 
 def _today_lagos() -> date:
     """Get today's date in Africa/Lagos timezone."""
@@ -39,7 +46,7 @@ def _today_lagos() -> date:
 
 # Sport key mapping: our name -> Odds API sport keys
 # RESTRICTED to Football (Soccer) and Tennis only — no other sports are scanned
-# to conserve API credits. Add more soccer/tennis leagues as needed.
+# to conserve API credits. Leagues that are off-season are skipped at fetch time.
 SPORT_KEY_MAP = {
     "Football": [
         {"key": "soccer_epl", "name": "English Premier League", "short": "EPL", "icon": "⚽"},
@@ -55,9 +62,12 @@ SPORT_KEY_MAP = {
         {"key": "soccer_turkey_super_league", "name": "Super Lig", "short": "Turkey", "icon": "⚽"},
         {"key": "soccer_usa_mls", "name": "MLS", "short": "MLS", "icon": "⚽"},
     ],
+    # Tennis tournament keys change through the season (tennis_atp_us_open,
+    # tennis_atp_paris_masters, ...), so tennis is matched by key prefix
+    # against the tournaments in today's odds data.
     "Tennis": [
-        {"key": "tennis_atp_us_open", "name": "ATP Tour", "short": "ATP", "icon": "🎾"},
-        {"key": "tennis_wta_us_open", "name": "WTA Tour", "short": "WTA", "icon": "🎾"},
+        {"key_prefix": "tennis_atp_", "name": "ATP Tour", "short": "ATP", "icon": "🎾"},
+        {"key_prefix": "tennis_wta_", "name": "WTA Tour", "short": "WTA", "icon": "🎾"},
     ],
 }
 
@@ -79,7 +89,6 @@ MARKET_LABELS = {
 
 # Unit mapping for totals/over-under markets: (sport_name, market_type) -> unit
 # Used to display the correct unit based on sport/market instead of hardcoding "Goals".
-# Only Football and Tennis are active (restricted in SPORT_KEY_MAP).
 MARKET_UNITS = {
     ("Football", "totals"): "Goals",
     ("Football", "alternate_totals"): "Goals",
@@ -102,7 +111,7 @@ def _get_market_unit(sport_name: str, market_type: str) -> str:
 # ---------------------------------------------------------------------------
 # Market category mapping (for market-diversity selection)
 # ---------------------------------------------------------------------------
-# Maps every market_type this project can produce (direct from the Odds API or
+# Maps every market_type this project can produce (direct from the odds feed or
 # derived locally in probability.py) to a diversity category. Robust to naming
 # variants (h2h/moneyline/match_winner/1x2 all map to "1x2").
 _MARKET_CATEGORY_MAP = {
@@ -115,7 +124,7 @@ _MARKET_CATEGORY_MAP = {
     "totals": "over_under",
     "alternate_totals": "over_under",
     "tennis_games": "over_under",
-    # BTTS (derived from totals)
+    # BTTS (derived from totals + h2h)
     "btts": "btts",
     # Double Chance (derived from h2h)
     "double_chance": "double_chance",
@@ -265,7 +274,7 @@ def _format_pick_description(
     sport_name: str | None = None,
 ) -> str | None:
     """
-    Format a clear, actionable pick description using the exact line from the Odds API.
+    Format a clear, actionable pick description using the exact line from the odds feed.
 
     Returns a human-readable string like:
     - "Chelsea to Win" (h2h)
@@ -281,12 +290,7 @@ def _format_pick_description(
     if market_type == "h2h":
         if outcome_name.lower() == "draw":
             return "Draw"
-        # Add "to Win" for clarity
-        suffix = ""
-        if probability >= 0.95:
-            suffix = " (Strong Favorite)"
-        elif probability >= 0.90:
-            suffix = " (Value Pick)"
+        suffix = " (Strong Favorite)" if probability >= 0.95 else ""
         return f"{outcome_name} to Win{suffix}"
 
     # For Draw No Bet (derived from h2h - draw outcome removed)
@@ -295,16 +299,16 @@ def _format_pick_description(
             return None  # Draw No Bet has no draw outcome
         return f"{outcome_name} to Win (Draw No Bet)"
 
-    # For Double Chance (derived from h2h)
+    # For Double Chance (derived from h2h), standard notation
     if market_type == "double_chance":
         labels = {
             "1X": f"{home_team} or Draw",
-            "12": f"{away_team} or Draw",
-            "X2": f"{home_team} or {away_team}",
+            "X2": f"{away_team} or Draw",
+            "12": f"{home_team} or {away_team}",
         }
         return labels.get(outcome_name, outcome_name)
 
-    # For BTTS (derived from totals)
+    # For BTTS (derived)
     if market_type == "btts":
         return outcome_name  # "BTTS Yes" or "BTTS No"
 
@@ -333,28 +337,10 @@ def _format_pick_description(
     return outcome_name
 
 
-def _find_outcome_point(
-    bookmakers: list[dict],
-    market_type: str,
-    outcome_name: str,
-) -> float | None:
-    """
-    Find the point/line value for a specific outcome from the API data.
-    Returns the point value or None if not found.
-    """
-    for bookmaker in bookmakers:
-        for mkt in bookmaker.get("markets", []):
-            if mkt.get("key") != market_type:
-                continue
-            for outcome in mkt.get("outcomes", []):
-                if outcome.get("name") == outcome_name:
-                    return outcome.get("point")
-    return None
-
 def _match_key(event: dict) -> str:
     """
     Unique identifier for a match, used to enforce one prediction per match.
-    Prefers the Odds API's unique event id; falls back to teams + kickoff.
+    Prefers the feed's unique event id; falls back to teams + kickoff.
     """
     event_id = event.get("id")
     if event_id:
@@ -396,19 +382,62 @@ def dedupe_by_match(predictions: list[dict]) -> list[dict]:
     return [best_by_match[key] for key in order]
 
 
+def _resolve_leagues() -> list[tuple[str, dict]]:
+    """
+    Expand SPORT_KEY_MAP into (sport_name, league) pairs with concrete keys.
+
+    Prefix entries (tennis) are matched against today's fetched sport keys —
+    tournament keys from The Odds API, or the generic ``tennis_atp`` /
+    ``tennis_wta`` keys used when a fallback provider supplied tennis. This
+    only touches the odds cache when such entries are configured.
+    Raises OddsAPIError if today's odds could not be fetched.
+    """
+    resolved = []
+    prefixed = []
+    for sport_name, leagues in SPORT_KEY_MAP.items():
+        for league in leagues:
+            if league.get("key"):
+                resolved.append((sport_name, league))
+            elif league.get("key_prefix"):
+                prefixed.append((sport_name, league))
+    if prefixed:
+        available = sorted(get_cached_sport_keys())
+        for sport_name, league in prefixed:
+            prefix = league["key_prefix"]
+            for key in available:
+                if key == prefix.rstrip("_") or key.startswith(prefix):
+                    resolved.append((sport_name, {**league, "key": key}))
+    return resolved
+
+
+def _parse_kickoff(commence_time: str | None) -> datetime | None:
+    """Parse a commence_time into an aware UTC datetime."""
+    if not commence_time:
+        return None
+    try:
+        if commence_time.endswith("Z"):
+            commence_time = commence_time[:-1] + "+00:00"
+        kickoff = datetime.fromisoformat(commence_time)
+    except (AttributeError, TypeError, ValueError):
+        return None
+    if kickoff.tzinfo is None:
+        kickoff = kickoff.replace(tzinfo=timezone.utc)
+    return kickoff.astimezone(timezone.utc)
+
+
 def generate_daily_predictions(
     seed_date: date | None = None,
     max_predictions: int | None = None,
 ) -> list[dict]:
     """
-    Generate real daily predictions from The Odds API.
+    Generate real daily predictions from today's odds.
 
     Logic:
     1. For each event, evaluate ALL available markets (direct + derived):
-       - Direct: h2h, spreads, totals (from the API)
-       - Derived: double_chance (from h2h), btts (from totals)
+       - Direct: h2h, spreads, totals (from the feed)
+       - Derived: double_chance (from h2h), btts (Poisson model)
     2. Apply quality threshold (default 50%); if fewer than
-       MIN_MATCHES_FOR_FULL_QUALITY meet the threshold, apply fallback:
+       MIN_MATCHES_FOR_FULL_QUALITY matches meet it, apply fallback:
        include top-ranked matches down to FALLBACK_PROBABILITY_FLOOR (40%).
     3. Market-diversity selection: rank candidates by
        probability * market-diversity multiplier, then build the final list
@@ -417,7 +446,8 @@ def generate_daily_predictions(
        one prediction per match.
     4. Tag each prediction with a confidence tier.
 
-    One prediction per match is strictly enforced.
+    One prediction per match is strictly enforced. Blocking (network on the
+    first call of the day) — call it via asyncio.to_thread from async code.
     """
     if max_predictions is None:
         max_predictions = config.MAX_DAILY_PREDICTIONS
@@ -425,104 +455,99 @@ def generate_daily_predictions(
     today = seed_date or _today_lagos()
     all_candidates = []
     errors = []
+    fetch_error = None
     seen_match_keys = set()
     raw_events_seen = 0
     events_today = 0
     events_no_bookmakers = 0
     per_sport_events: dict[str, int] = {}
-    for sport_name, leagues in SPORT_KEY_MAP.items():
-        for league in leagues:
-            sport_key = league["key"]
-            league_name = league["name"]
 
-            try:
-                odds_data = get_odds(sport_key, markets="h2h,spreads,totals")
+    try:
+        leagues_to_scan = _resolve_leagues()
+    except OddsAPIError as e:
+        fetch_error = str(e)
+        leagues_to_scan = []
 
-                for event in odds_data:
-                    raw_events_seen += 1
-                    commence_time_str = event.get("commence_time", "")
-                    if not commence_time_str:
-                        continue
+    for sport_name, league in leagues_to_scan:
+        sport_key = league["key"]
+        try:
+            odds_data = get_odds(sport_key)
+        except OddsAPIError as e:
+            # Every league reads the same shared daily fetch, so a failure
+            # here applies to all of them. Stop instead of re-triggering the
+            # fetch once per league.
+            fetch_error = str(e)
+            break
 
-                    try:
-                        if commence_time_str.endswith("Z"):
-                            commence_time_str = commence_time_str[:-1] + "+00:00"
-                        event_dt = datetime.fromisoformat(commence_time_str)
+        if league.get("key_prefix"):
+            title = next(
+                (event.get("sport_title") for event in odds_data if event.get("sport_title")),
+                None,
+            )
+            if title:
+                league = {**league, "name": title}
 
-                        if event_dt.tzinfo is None:
-                            event_dt = event_dt.replace(tzinfo=timezone.utc)
+        try:
+            for event in odds_data:
+                raw_events_seen += 1
+                kickoff = _parse_kickoff(event.get("commence_time"))
+                # STRICT GUARD: exclude matches that have already kicked off
+                # or finished. Only future matches today are eligible.
+                if kickoff is None or kickoff <= datetime.now(timezone.utc):
+                    continue
+                if kickoff.astimezone(LAGOS_TZ).date() != today:
+                    continue
 
-                        # STRICT GUARD: Exclude matches that have already kicked off
-                        # or finished. Only future matches are eligible.
-                        if event_dt <= datetime.now(timezone.utc):
-                            continue
+                events_today += 1
+                per_sport_events[sport_key] = per_sport_events.get(sport_key, 0) + 1
 
-                        event_dt_lagos = event_dt.astimezone(LAGOS_TZ)
-                        if event_dt_lagos.date() != today:
-                            continue
-                    except (ValueError, TypeError):
-                        continue
+                # Group by match — each match processed once
+                match_key = _match_key(event)
+                if match_key in seen_match_keys:
+                    continue
 
-                    events_today += 1
-                    per_sport_events[sport_key] = (
-                        per_sport_events.get(sport_key, 0) + 1
-                    )
+                if not event.get("bookmakers"):
+                    events_no_bookmakers += 1
+                    continue
 
-                    # Group by match — each match processed once
-                    match_key = _match_key(event)
-                    if match_key in seen_match_keys:
-                        continue
+                # Evaluate all markets for this match; the diverse
+                # selection step later keeps at most one per match.
+                base = _candidate_base(event, sport_name, league, match_key, kickoff, today)
+                match_candidates = _evaluate_match_markets(event, sport_name, base)
 
-                    home_team = event.get("home_team", "Unknown")
-                    away_team = event.get("away_team", "Unknown")
-                    match_str = f"{home_team} vs {away_team}"
+                if match_candidates:
+                    seen_match_keys.add(match_key)
+                    all_candidates.extend(match_candidates)
 
-                    bookmakers = event.get("bookmakers", [])
-                    if not bookmakers:
-                        events_no_bookmakers += 1
-                        continue
+        except (
+            AttributeError,
+            IndexError,
+            KeyError,
+            OSError,
+            TypeError,
+            ValueError,
+            ZeroDivisionError,
+        ) as e:
+            errors.append(f"{league['name']}: {e}")
+            logger.error(f"Invalid odds data for {league['name']}: {e}")
 
-                    # Evaluate all markets for this match; the diverse
-                    # selection step later keeps at most one per match.
-                    match_candidates = _evaluate_match_markets(
-                        event, bookmakers, sport_name, league,
-                        home_team, away_team, match_str, match_key,
-                        event_dt_lagos, today,
-                    )
+    if fetch_error:
+        errors.append(f"Odds fetch failed: {fetch_error}")
+        logger.warning("Odds fetch failed; no odds to predict from: %s", fetch_error)
 
-                    if match_candidates:
-                        seen_match_keys.add(match_key)
-                        all_candidates.extend(match_candidates)
-
-            except OddsAPIError as e:
-                errors.append(f"{league_name}: {e}")
-                logger.warning(f"Failed to fetch odds for {league_name}: {e}")
-            except (
-                AttributeError,
-                IndexError,
-                KeyError,
-                OSError,
-                TypeError,
-                ValueError,
-                ZeroDivisionError,
-            ) as e:
-                errors.append(f"{league_name}: {e}")
-                logger.error(f"Invalid odds data for {league_name}: {e}")
+    # Low-volume rule: the 40% fallback applies when fewer than
+    # MIN_MATCHES_FOR_FULL_QUALITY distinct matches reach MIN_PROBABILITY
+    # (several markets of the same match count once).
+    qualifying_matches = {
+        c["event_id"] for c in all_candidates if c["confidence"] >= config.MIN_PROBABILITY
+    }
+    low_volume_day = len(qualifying_matches) < config.MIN_MATCHES_FOR_FULL_QUALITY
 
     # Per-market probability floors (config.MARKET_MIN_PROBABILITY_FLOORS):
     # on the standard path a candidate must clear its own market category's
     # floor BEFORE it is eligible for the threshold/diversity selection below.
-    # This stops a weak pick in a naturally-high-scoring market (e.g. Double
-    # Chance) from slipping through just because that market's consensus
-    # probabilities run high on average. The low-volume fallback rule (down to
-    # FALLBACK_PROBABILITY_FLOOR) is deliberately untouched so quiet days
+    # The low-volume fallback rule is deliberately untouched so quiet days
     # still surface picks.
-    qualifying_count = sum(
-        1 for c in all_candidates if c["confidence"] >= config.MIN_PROBABILITY
-    )
-    low_volume_day = (
-        qualifying_count < config.MIN_MATCHES_FOR_FULL_QUALITY
-    )
     threshold_candidates = all_candidates
     if not low_volume_day:
         threshold_candidates = [
@@ -541,8 +566,7 @@ def generate_daily_predictions(
     # then build the final list in rounds (one pick per market category
     # first, then fill by ranking score) while respecting per-market limits,
     # the total cap, and one prediction per match. The selection floor mirrors
-    # the threshold/fallback decision so the existing low-volume rule
-    # (down to FALLBACK_PROBABILITY_FLOOR) keeps working.
+    # the threshold/fallback decision.
     selection_floor = (
         config.FALLBACK_PROBABILITY_FLOOR
         if low_volume_day
@@ -572,16 +596,18 @@ def generate_daily_predictions(
         "errors": len(errors),
         "error_details": errors[:10],
         "per_sport_events": dict(sorted(per_sport_events.items())),
-        "fallback_applied": before_threshold < config.MIN_MATCHES_FOR_FULL_QUALITY,
+        "fallback_applied": low_volume_day,
     })
     if before_threshold == 0:
-        if events_today == 0:
-            reason = (
-                f"0 matches kick off today ({today}, Africa/Lagos) — raw "
-                f"events: {raw_events_seen}. All matches are for other days."
-            )
+        if fetch_error:
+            reason = f"Odds fetch failed: {fetch_error}"
         elif raw_events_seen == 0:
-            reason = "API returned no events for any configured league."
+            reason = "No events returned for any configured league."
+        elif events_today == 0:
+            reason = (
+                f"0 upcoming matches kick off today ({today}, Africa/Lagos) — "
+                f"raw events: {raw_events_seen}. The rest are other days or started."
+            )
         else:
             reason = (
                 f"{events_today} matches today but 0 passed market/consensus "
@@ -597,13 +623,10 @@ def generate_daily_predictions(
         "Prediction summary for %s: %d raw events fetched, %d events "
         "kick off today (Lagos), %d candidates passed market/consensus "
         "evaluation, %d passed the threshold/fallback filter "
-        "(capped at %d). %d league errors.",
+        "(capped at %d). %d errors.",
         today, raw_events_seen, events_today, len(all_candidates),
         len(predictions), max_predictions, len(errors),
     )
-
-    if errors:
-        logger.info(f"Prediction generation completed with {len(errors)} errors")
 
     return predictions[:max_predictions]
 
@@ -613,72 +636,96 @@ def get_last_generation_stats() -> dict:
     return dict(_last_generation_stats)
 
 
-def _evaluate_match_markets(
+def _candidate_base(
     event: dict,
-    bookmakers: list[dict],
     sport_name: str,
     league: dict,
-    home_team: str,
-    away_team: str,
-    match_str: str,
     match_key: str,
-    event_dt_lagos: datetime,
+    kickoff: datetime,
     today: date,
-) -> list[dict]:
+) -> dict:
+    """Match-level fields shared by every candidate for one event."""
+    home_team = event.get("home_team", "Unknown")
+    away_team = event.get("away_team", "Unknown")
+    return {
+        "event_id": match_key,
+        "source": event.get("source", "the-odds-api"),
+        "sport": sport_name,
+        "sport_key": league["key"],
+        "sport_icon": league["icon"],
+        "league": league["name"],
+        "league_short": league["short"],
+        "match": f"{home_team} vs {away_team}",
+        "home_team": home_team,
+        "away_team": away_team,
+        "date": today.isoformat(),
+        "match_time": kickoff.astimezone(LAGOS_TZ).strftime("%H:%M"),
+        "match_date": today.isoformat(),
+        "kickoff_utc": kickoff.isoformat(),
+        "commence_time": kickoff.isoformat(),
+    }
+
+
+def _evaluate_match_markets(event: dict, sport_name: str, base: dict) -> list[dict]:
     """
     Evaluate all markets for a single match.
 
-    Returns one best candidate per market type (direct markets from the API
+    Returns one best candidate per market type (direct markets from the feed
     plus derived double_chance/btts). The final per-match selection is made
     later by _select_diverse_predictions, which enforces one prediction per
     match and market diversity.
     """
     candidates: dict[str, dict] = {}
     market_keys = set()
-    for bookmaker in bookmakers:
+    for bookmaker in event.get("bookmakers", []):
         for mkt in bookmaker.get("markets", []):
             key = mkt.get("key", "")
             if key and not key.endswith("_lay"):
                 market_keys.add(key)
-    for mkt_type in market_keys:
+
+    for mkt_type in sorted(market_keys):
         probs = consensus_probabilities(event, market=mkt_type)
-        candidate = _evaluate_market_outcomes(
-            probs, bookmakers, mkt_type, sport_name, league,
-            home_team, away_team, match_str, match_key, event_dt_lagos, today)
+        prices = {
+            name: best_price_and_point(event, mkt_type, name) for name in probs
+        }
+        candidate = _best_candidate(probs, prices, mkt_type, sport_name, base)
         if candidate is not None:
             candidates[mkt_type] = candidate
+
     if sport_name == "Football":
         dc_probs = calculate_double_chance_probabilities(event)
         if dc_probs:
-            candidate = _evaluate_derived_outcomes(
-                dc_probs, "double_chance", sport_name, league,
-                home_team, away_team, match_str, match_key, event_dt_lagos, today)
+            dc_odds = double_chance_odds(event)
+            prices = {name: (dc_odds.get(name), None) for name in dc_probs}
+            candidate = _best_candidate(dc_probs, prices, "double_chance", sport_name, base)
             if candidate is not None:
                 candidates["double_chance"] = candidate
         btts_probs = calculate_btts_probabilities(event)
         if btts_probs:
-            candidate = _evaluate_derived_outcomes(
-                btts_probs, "btts", sport_name, league,
-                home_team, away_team, match_str, match_key, event_dt_lagos, today)
+            # No bookmaker prices for BTTS on the featured-odds feeds:
+            # show the model's fair odds and flag them as estimated.
+            prices = {
+                name: (1.0 / min(data["probability"], 0.99), None)
+                for name, data in btts_probs.items()
+                if data["probability"] > 0
+            }
+            candidate = _best_candidate(
+                btts_probs, prices, "btts", sport_name, base, odds_estimated=True,
+            )
             if candidate is not None:
                 candidates["btts"] = candidate
     return list(candidates.values())
 
 
-def _evaluate_market_outcomes(
+def _best_candidate(
     probs: dict[str, dict],
-    bookmakers: list[dict],
+    prices: dict[str, tuple[float | None, float | None]],
     market_type: str,
     sport_name: str,
-    league: dict,
-    home_team: str,
-    away_team: str,
-    match_str: str,
-    match_key: str,
-    event_dt_lagos: datetime,
-    today: date,
+    base: dict,
+    odds_estimated: bool = False,
 ) -> dict | None:
-    """Evaluate all outcomes in a single market, return best candidate."""
+    """Return the strongest outcome of one market as a candidate, if any qualifies."""
     best_candidate = None
     best_rank = None
     for outcome_name, data in probs.items():
@@ -688,104 +735,44 @@ def _evaluate_market_outcomes(
         if probability < config.FALLBACK_PROBABILITY_FLOOR:
             continue
         probability = min(probability, 0.99)
-        best_odds = None
-        for bookmaker in bookmakers:
-            for mkt in bookmaker.get("markets", []):
-                if mkt.get("key") != market_type:
-                    continue
-                for outcome in mkt.get("outcomes", []):
-                    if outcome.get("name") == outcome_name:
-                        price = outcome.get("price", 0)
-                        if best_odds is None or price > best_odds:
-                            best_odds = price
-        if best_odds is None or best_odds < 1.01:
+        odds, point = prices.get(outcome_name, (None, None))
+        if odds is None or odds < 1.01:
             continue
-        point = _find_outcome_point(bookmakers, market_type, outcome_name)
         pick = _format_pick_description(
             market_type, outcome_name, point,
-            home_team, away_team, probability, sport_name=sport_name)
+            base["home_team"], base["away_team"], probability, sport_name=sport_name)
         if pick is None:
             continue
-        rank = (probability, data["num_bookmakers"], best_odds)
+        rank = (probability, data["num_bookmakers"], odds)
         if best_rank is None or rank > best_rank:
             best_rank = rank
             best_candidate = {
-                "event_id": match_key, "sport": sport_name,
-                "sport_icon": league["icon"], "league": league["name"],
-                "league_short": league["short"], "match": match_str,
-                "home_team": home_team, "away_team": away_team,
+                **base,
                 "market_type": market_type,
                 "market_label": MARKET_LABELS.get(market_type, market_type),
-                "pick": pick, "odds": round(best_odds, 2),
-                "confidence": round(probability, 2),
+                "pick": pick,
+                "odds": round(odds, 2),
+                "odds_estimated": odds_estimated,
+                "confidence": round(probability, CONFIDENCE_DECIMALS),
                 "num_bookmakers": data["num_bookmakers"],
-                "date": today.isoformat(),
-                "match_time": event_dt_lagos.strftime("%H:%M"),
-                "match_date": today.strftime("%Y-%m-%d"), "kickoff_utc": None,
-            }
-    return best_candidate
-
-
-def _evaluate_derived_outcomes(
-    probs: dict[str, dict],
-    market_type: str,
-    sport_name: str,
-    league: dict,
-    home_team: str,
-    away_team: str,
-    match_str: str,
-    match_key: str,
-    event_dt_lagos: datetime,
-    today: date,
-) -> dict | None:
-    """Evaluate outcomes for a derived market (double_chance or btts)."""
-    best_candidate = None
-    best_rank = None
-    for outcome_name, data in probs.items():
-        if data["num_bookmakers"] < config.MIN_BOOKMAKERS:
-            continue
-        probability = data["probability"]
-        if probability < config.FALLBACK_PROBABILITY_FLOOR:
-            continue
-        probability = min(probability, 0.99)
-        estimated_odds = round(1.0 / probability, 2) if probability > 0 else None
-        if estimated_odds is None or estimated_odds < 1.01:
-            continue
-        pick = _format_pick_description(
-            market_type, outcome_name, None,
-            home_team, away_team, probability, sport_name=sport_name)
-        if pick is None:
-            continue
-        rank = (probability, data["num_bookmakers"], estimated_odds)
-        if best_rank is None or rank > best_rank:
-            best_rank = rank
-            best_candidate = {
-                "event_id": match_key, "sport": sport_name,
-                "sport_icon": league["icon"], "league": league["name"],
-                "league_short": league["short"], "match": match_str,
-                "home_team": home_team, "away_team": away_team,
-                "market_type": market_type,
-                "market_label": MARKET_LABELS.get(market_type, market_type),
-                "pick": pick, "odds": estimated_odds,
-                "confidence": round(probability, 2),
-                "num_bookmakers": data["num_bookmakers"],
-                "date": today.isoformat(),
-                "match_time": event_dt_lagos.strftime("%H:%M"),
-                "match_date": today.strftime("%Y-%m-%d"), "kickoff_utc": None,
             }
     return best_candidate
 
 
 def _apply_threshold_with_fallback(candidates, min_threshold, fallback_floor, min_matches):
-    """Apply quality threshold with fallback for low-volume days."""
+    """Apply quality threshold with fallback for low-volume days.
+
+    ``min_matches`` counts distinct matches, not market candidates.
+    """
     qualifying = [c for c in candidates if c["confidence"] >= min_threshold]
-    if len(qualifying) >= min_matches:
-        logger.info(f"Threshold filter: {len(qualifying)} matches meet {min_threshold:.0%}")
+    matches = {c.get("event_id") or c.get("match") for c in qualifying}
+    if len(matches) >= min_matches:
+        logger.info(f"Threshold filter: {len(matches)} matches meet {min_threshold:.0%}")
         return qualifying
-    logger.info(f"Low-volume day: {len(qualifying)} matches (need {min_matches}). Fallback to {fallback_floor:.0%}")
+    logger.info(f"Low-volume day: {len(matches)} matches (need {min_matches}). Fallback to {fallback_floor:.0%}")
     sorted_candidates = sorted(candidates, key=lambda x: x["confidence"], reverse=True)
     fallback = [c for c in sorted_candidates if c["confidence"] >= fallback_floor]
-    logger.info(f"Fallback: returning {len(fallback)} matches")
+    logger.info(f"Fallback: returning {len(fallback)} candidates")
     return fallback
 
 
@@ -1046,7 +1033,7 @@ def build_target_odds_accumulator(
     )
 
 
-def get_top_picks(predictions: list[dict], count: int = 5) -> list[dict]:
+def get_top_picks(predictions: list[dict] | None, count: int = 5) -> list[dict]:
     """Return the top-picks accumulator with probability fallback cascade.
 
     Probability tiers: 70-90% → 60-70% → 50-60%.
@@ -1058,11 +1045,11 @@ def get_top_picks(predictions: list[dict], count: int = 5) -> list[dict]:
     """
     from probability import filter_by_probability_bracket
 
+    predictions = predictions or []
     tiers = config.TOP_PICK_PROBABILITY_TIERS
     best_result: list[dict] = []
 
-    for tier_idx, (lo, hi) in enumerate(tiers):
-        tier_candidates = filter_by_probability_bracket(predictions, lo, hi)
+    for tier_idx in range(len(tiers)):
         # Combine all candidates from tiers tried so far (higher tiers first)
         cumulative = []
         seen_keys: set[tuple[str, str]] = set()
@@ -1102,7 +1089,7 @@ def get_top_picks(predictions: list[dict], count: int = 5) -> list[dict]:
     return best_result
 
 
-def get_all_picks(predictions: list[dict], top_picks: list[dict] | None = None) -> list[dict]:
+def get_all_picks(predictions: list[dict] | None, top_picks: list[dict] | None = None) -> list[dict]:
     """Return the all-picks accumulator with probability fallback cascade.
 
     Probability tiers: 65-90% → 55-65% → 50-55%.
@@ -1115,6 +1102,7 @@ def get_all_picks(predictions: list[dict], top_picks: list[dict] | None = None) 
     """
     from probability import filter_by_probability_bracket
 
+    predictions = predictions or []
     excluded: set[tuple[str, str]] = {
         _match_pick_key(p) for p in (top_picks or [])
     }
@@ -1122,7 +1110,7 @@ def get_all_picks(predictions: list[dict], top_picks: list[dict] | None = None) 
     tiers = config.ALL_PICK_PROBABILITY_TIERS
     best_result: list[dict] = []
 
-    for tier_idx, (lo, hi) in enumerate(tiers):
+    for tier_idx in range(len(tiers)):
         # Combine all candidates from tiers tried so far (higher tiers first)
         cumulative: list[dict] = []
         seen_keys: set[tuple[str, str]] = set()
@@ -1195,6 +1183,6 @@ def build_accumulator(picks: list[dict]) -> dict:
     }
 
 
-def filter_by_sport(predictions: list[dict], sport: str) -> list[dict]:
+def filter_by_sport(predictions: list[dict] | None, sport: str) -> list[dict]:
     """Filter predictions by sport name."""
-    return [p for p in predictions if p["sport"].lower() == sport.lower()]
+    return [p for p in predictions or [] if p["sport"].lower() == sport.lower()]

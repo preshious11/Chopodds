@@ -60,7 +60,6 @@ class TestStatsCache:
         counters = {"global": 0}
 
         real_global = tracking.get_global_stats
-        real_user = tracking.get_user_stats
 
         def counting_global(*a, **k):
             counters["global"] += 1

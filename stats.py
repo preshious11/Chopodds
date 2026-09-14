@@ -9,7 +9,7 @@ cleans up that cache on ``invalidate_stats_cache()`` when settlement completes.
 """
 
 import time
-from datetime import datetime, timezone
+from datetime import datetime
 from threading import Lock
 from zoneinfo import ZoneInfo
 

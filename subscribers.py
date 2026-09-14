@@ -4,12 +4,13 @@ Subscriber management - stores chat IDs with UTC join timestamps.
 
 import json
 from datetime import datetime, timezone
-from pathlib import Path
 from threading import Lock
+
+import config
 
 _lock = Lock()
 
-SUBSCRIBERS_FILE = Path(__file__).resolve().parent / "subscribers.json"
+SUBSCRIBERS_FILE = config.DATA_DIR / "subscribers.json"
 
 
 def _load_subscribers() -> dict:

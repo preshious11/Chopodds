@@ -1,15 +1,16 @@
 """
 Sports Prediction Telegram Bot — Production Ready
 ===================================================
-Automated daily predictions across diverse sports and betting markets.
+Automated daily Football and Tennis predictions across diverse betting markets.
 """
 
 import asyncio
 import logging
 import signal
+import sqlite3
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, time as dt_time, timedelta, timezone
 from logging.handlers import TimedRotatingFileHandler
 
 from zoneinfo import ZoneInfo
@@ -22,12 +23,20 @@ from telegram.ext import (
     CallbackQueryHandler,
     ContextTypes,
 )
-from telegram.error import BadRequest, TelegramError, NetworkError, TimedOut
+from telegram.error import (
+    BadRequest,
+    Forbidden,
+    NetworkError,
+    RetryAfter,
+    TelegramError,
+    TimedOut,
+)
 from telegram.request import HTTPXRequest
 
 import config
 from daily_cache import (
     CACHE_DIR,
+    cleanup_old_cache,
     clear_today_cache,
     ensure_populated,
     get_cached_odds,
@@ -36,19 +45,20 @@ from daily_cache import (
 )
 from odds_client import _fetch_all_sports_odds
 import odds_client
-import predictions
 from settlement import settle_pending_predictions
 import tracking
 from predictions import (
-    generate_daily_predictions,
-    get_top_picks,
-    get_all_picks,
     filter_by_sport,
+    generate_daily_predictions,
+    get_all_picks,
+    get_last_generation_stats,
+    get_top_picks,
 )
 from subscribers import (
     add_subscriber,
     get_all_chat_ids,
     get_subscriber_join_date,
+    remove_subscriber,
 )
 from stats import format_stats_message
 from formatters import (
@@ -78,7 +88,7 @@ def configure_logging() -> None:
     if not any(getattr(handler, "_sportsbot_file", False)
                for handler in root_logger.handlers):
         file_handler = TimedRotatingFileHandler(
-            "bot_activity.log",
+            config.DATA_DIR / "bot_activity.log",
             when="midnight",
             backupCount=7,
             encoding="utf-8",
@@ -99,15 +109,20 @@ _BOT_STARTED_AT = datetime.now(timezone.utc)
 # Cache predictions per day (Lagos date)
 _cached_predictions = None
 _cached_date = None
-_prediction_lock = asyncio.Lock()  # Prevents duplicate API calls from simultaneous users
+_prediction_lock = asyncio.Lock()  # Prevents duplicate API calls from simultaneous users (recreated per lifecycle in run_bot)
 _is_generating = False  # Flag to show loading message
+
+_EMPTY_STATE_MESSAGE = (
+    "⚠️ No predictions available for today's matches. Check back tomorrow morning!"
+)
 
 
 async def get_today_predictions() -> list:
     """
     Get today's predictions (cached per day, Africa/Lagos timezone).
-    Thread-safe: only the first concurrent caller triggers generation.
-    All subsequent calls (pagination, other users) read from cache.
+    Only the first concurrent caller triggers generation, which runs in a
+    worker thread so the bot keeps answering other users meanwhile.
+    Always returns a list (empty when nothing could be generated).
     """
     global _cached_predictions, _cached_date, _is_generating
 
@@ -127,7 +142,7 @@ async def get_today_predictions() -> list:
         # We are the first caller — generate predictions
         _is_generating = True
         try:
-            predictions = generate_daily_predictions(max_predictions=20)
+            predictions = await asyncio.to_thread(generate_daily_predictions)
             if predictions:
                 tracking.record_predictions(predictions)
                 _cached_predictions = predictions
@@ -135,9 +150,8 @@ async def get_today_predictions() -> list:
                 log.info(f"Generated {len(predictions)} predictions for {today_lagos} (Lagos)")
             else:
                 # Do NOT cache an empty result for the whole day — leave the
-                # date un-set so the next request retries the fetch. This
-                # prevents a transient API failure from locking the bot into
-                # "no predictions available" until midnight.
+                # date un-set so the next request retries. The odds cache and
+                # its failure cooldown stop this from re-calling the APIs.
                 _cached_predictions = None
                 log.warning(
                     "Prediction generation returned 0 matches for %s (Lagos); "
@@ -154,13 +168,14 @@ async def get_today_predictions() -> list:
             TypeError,
             ValueError,
             ZeroDivisionError,
+            sqlite3.Error,
         ) as e:
-            log.error(f"Network error generating predictions: {e}")
+            log.error(f"Error generating predictions: {e}")
             _cached_predictions = None
         finally:
             _is_generating = False
 
-    return _cached_predictions
+    return _cached_predictions or []
 
 
 def is_generating() -> bool:
@@ -189,7 +204,7 @@ async def _send_loading(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Send a visible loading message only when a fresh fetch is expected
     loading_msg = None
     if needs_refresh() or is_generating():
-        loading_msg = await update.message.reply_text(
+        loading_msg = await update.effective_message.reply_text(
             "🔍 Scanning markets for today's predictions...\n"
             "⏳ This may take a moment..."
         )
@@ -214,7 +229,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /start command — welcome user and save subscriber."""
     chat_id = update.effective_chat.id
     user = update.effective_user
-    username = user.username or user.first_name or ""
+    username = (user.username or user.first_name or "") if user else ""
 
     is_new = add_subscriber(chat_id, username)
     subscriber_count = len(get_all_chat_ids())
@@ -224,52 +239,53 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"{'✅ You are now subscribed!' if is_new else '👋 Welcome back!'}\n"
         f"📊 Subscribers: <b>{subscriber_count}</b>\n\n"
         f"<b>Available Commands:</b>\n"
-        f"/dailypick — Top 3-5 picks for today\n"
-        f"/toppicks — All predictions (paginated)\n"
+        f"/dailypick — Today's top picks (~2.00 odds)\n"
+        f"/toppicks — All predictions accumulator (paginated)\n"
         f"/sports — Filter by sport\n"
         f"/stats — Historical performance\n"
+        f"/stop — Unsubscribe from daily picks\n"
         f"/help — Show this menu\n\n"
-        f"<i>You will receive daily picks automatically at {config.DAILY_BROADCAST_TIME} UTC</i>"
+        f"<i>You will receive daily picks automatically at "
+        f"{escape(config.DAILY_BROADCAST_TIME)} (Africa/Lagos time)</i>"
     )
 
-    await update.message.reply_text(welcome_msg, parse_mode="HTML")
-
-
+    await update.effective_message.reply_text(welcome_msg, parse_mode="HTML")
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /help command."""
     help_msg = (
-        "📖 <b>Sports Predictions Bot — Help</b>\n\n"
-        "<i>⚠️ DEMO MODE — Mock predictions for testing purposes only</i>\n\n"
+        "📖 <b>BetVault — Help</b>\n\n"
         "<b>Commands:</b>\n"
         "/start — Subscribe & show welcome\n"
-        "/dailypick — Top 3-5 confidence picks today\n"
-        "/toppicks — Browse all picks (paginated, 5 per page)\n"
+        "/dailypick — Today's top picks accumulator (~2.00 odds)\n"
+        "/toppicks — All predictions accumulator (paginated)\n"
         "/sports — Filter predictions by sport\n"
-        "/stats — View historical win rate\n"
+        "/stats — Win rate of settled predictions\n"
+        "/stop — Unsubscribe from the daily broadcast\n"
         "/help — This message\n\n"
-        "<b>Features:</b>\n"
-        "• Predictions refresh daily at midnight\n"
-        "• Automated broadcast at 09:00 UTC\n"
-        "• Markets: 1X2, O/U, BTTS, Spread, Corners, Cards\n"
-        "• Sports: Football, Basketball, Tennis, NHL, Cricket, NFL\n\n"
+        "<b>How it works:</b>\n"
+        "• Live odds from multiple bookmakers, margin removed and averaged "
+        "into a consensus probability\n"
+        "• Predictions refresh daily at midnight (Africa/Lagos)\n"
+        f"• Daily broadcast at {escape(config.DAILY_BROADCAST_TIME)} (Africa/Lagos)\n"
+        "• Markets: 1X2, Double Chance, Over/Under, BTTS, Handicap\n"
+        "• Sports: Football and Tennis\n\n"
+        "<i>Odds marked (est.) are model estimates, not bookmaker prices.</i>\n"
         "<i>Disclaimer: Predictions are for informational purposes only.</i>"
     )
-    await update.message.reply_text(help_msg, parse_mode="HTML")
+    await update.effective_message.reply_text(help_msg, parse_mode="HTML")
 
 
 async def dailypick(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /dailypick — show top 3-5 predictions for today."""
+    """Handle /dailypick — show today's top-picks accumulator."""
     loading_msg = await _send_loading(update, context)
     predictions = await get_today_predictions()
     top = get_top_picks(predictions, count=config.DAILY_PICK_COUNT)
 
     if not top:
         await _clear_loading(loading_msg)
-        await update.message.reply_text(
-            "⚠️ No predictions available for today's matches. Check back tomorrow morning!"
-        )
+        await update.effective_message.reply_text(_EMPTY_STATE_MESSAGE)
         return
 
     msg = format_top_picks(top, count=config.DAILY_PICK_COUNT)
@@ -283,31 +299,28 @@ async def dailypick(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _clear_loading(loading_msg)
     output, is_file = safe_message(msg)
     if is_file:
-        await update.message.reply_document(
+        await update.effective_message.reply_document(
             document=output,
             caption="📋 Top picks for today (file format due to length)",
             parse_mode="HTML",
         )
     else:
-        await update.message.reply_text(output, parse_mode="HTML", reply_markup=reply_markup)
-    tracking.record_predictions(top, update.effective_user.id)
+        await update.effective_message.reply_text(output, parse_mode="HTML", reply_markup=reply_markup)
+    tracking.record_predictions(top, update.effective_chat.id)
 
 async def toppicks(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /toppicks — show all-picks accumulator (65%+ probability).
+    """Handle /toppicks — show the all-picks accumulator.
 
-    The all-picks accumulator targets combined odds of 10.0 with up to 10
-    legs, using a 65% probability floor. Exact match+pick pairings already
-    used in the top-picks accumulator are excluded so the same selection
-    never appears in both /dailypick and /toppicks.
+    Exact match+pick pairings already used in the top-picks accumulator are
+    excluded so the same selection never appears in both /dailypick and
+    /toppicks.
     """
     loading_msg = await _send_loading(update, context)
     predictions = await get_today_predictions()
 
     if not predictions:
         await _clear_loading(loading_msg)
-        await update.message.reply_text(
-            "⚠️ No predictions available for today's matches. Check back tomorrow morning!"
-        )
+        await update.effective_message.reply_text(_EMPTY_STATE_MESSAGE)
         return
 
     top = get_top_picks(predictions)
@@ -325,7 +338,7 @@ async def send_paginated_predictions(
     page: int = 1,
     loading_msg=None,
 ):
-    """Send or edit paginated predictions message."""
+    """Send (for a command Update) or edit (for a CallbackQuery) paginated predictions."""
     msg, total_pages = format_all_picks_paginated(predictions, page=page, per_page=5)
 
     # Build navigation buttons
@@ -360,25 +373,20 @@ async def send_paginated_predictions(
     reply_markup = InlineKeyboardMarkup(buttons)
 
     # Delete loading message if present
-    if loading_msg:
-        try:
-            await loading_msg.delete()
-        except TelegramError:
-            pass
+    await _clear_loading(loading_msg)
 
     try:
-        if hasattr(update_or_query, "message"):
-            # Called from command
-            await update_or_query.message.reply_text(
+        # A CallbackQuery also has a .message attribute, so check the type
+        # explicitly: commands send a new message, button presses edit.
+        if isinstance(update_or_query, Update):
+            await update_or_query.effective_message.reply_text(
                 msg, parse_mode="HTML", reply_markup=reply_markup
             )
+            tracking.record_predictions(predictions, update_or_query.effective_chat.id)
         else:
-            # Called from callback query
             await update_or_query.edit_message_text(
                 msg, parse_mode="HTML", reply_markup=reply_markup
             )
-        if hasattr(update_or_query, "message"):
-            tracking.record_predictions(predictions, update_or_query.effective_user.id)
     except BadRequest as e:
         if "Message is not modified" in str(e):
             return  # Ignore double-click
@@ -410,24 +418,53 @@ async def sports_filter(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await _clear_loading(loading_msg)
     reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_text(
+    await update.effective_message.reply_text(
         format_sport_filter_buttons(predictions), parse_mode="HTML", reply_markup=reply_markup
     )
-    tracking.record_predictions(predictions, update.effective_user.id)
 
 
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show global performance and this user's delivery statistics."""
+    """Show global performance and this chat's delivery statistics."""
     chat_id = update.effective_chat.id
     user_joined_at = get_subscriber_join_date(chat_id)
     msg = format_stats_message(user_id=chat_id, user_joined_at=user_joined_at)
-    await update.message.reply_text(msg, parse_mode="HTML")
+    await update.effective_message.reply_text(msg, parse_mode="HTML")
+
+
+async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /stop — unsubscribe this chat from the daily broadcast."""
+    if remove_subscriber(update.effective_chat.id):
+        text = (
+            "✅ You have been unsubscribed from the daily broadcast.\n"
+            "Send /start any time to subscribe again."
+        )
+    else:
+        text = "ℹ️ You are not subscribed. Send /start to subscribe."
+    await update.effective_message.reply_text(text)
+
+
+def _provider_status_lines() -> list[str]:
+    """One line per odds provider for /status: key, what it served, errors."""
+    report = odds_client.get_last_fetch_report()
+    providers = report.get("providers") or {}
+    lines = []
+    for name in config.ODDS_PROVIDER_ORDER:
+        entry = providers.get(name, {})
+        line = f"• {escape(name)}: {'key set' if odds_client.provider_configured(name) else '❌ no key'}"
+        if entry.get("answered"):
+            line += f" | served {entry['answered']} league(s)"
+        elif report and not entry.get("attempted") and not entry.get("error"):
+            line += " | not needed"
+        if entry.get("error"):
+            line += f" | ⚠️ {escape(str(entry['error'])[:120])}"
+        lines.append(line)
+    lines.append(f"<b>Last odds fetch:</b> {escape(report.get('at', 'none since restart'))}")
+    return lines
 
 
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Report bot health and today's cache metrics to the administrator."""
-    user = update.effective_user
-    if user is None or user.id != config.ADMIN_CHAT_ID:
+    if not _is_admin(update):
         return
 
     cache_path = CACHE_DIR / f"odds_{get_lagos_date_str()}.json"
@@ -450,8 +487,8 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tracking_health = tracking.get_health_metrics()
 
     # Odds API diagnostics
-    api_status = odds_client.check_api_key()
-    gen_stats = predictions.get_last_generation_stats()
+    api_status = await asyncio.to_thread(odds_client.check_api_key)
+    gen_stats = get_last_generation_stats()
     api_key_display = (
         "Configured" if api_status["configured"] else "❌ MISSING"
     )
@@ -473,12 +510,14 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"<b>Cache size:</b> {cache_size:,} bytes\n"
         f"<b>Cached sports:</b> {cached_sports}\n"
         f"<b>Cached matches:</b> {cached_matches}\n"
-        "<b>— Odds API —</b>\n"
+        "<b>— The Odds API —</b>\n"
         f"<b>API key:</b> {api_key_display}\n"
-        f"<b>API key check:</b> {api_valid_display}\n"
+        f"<b>API key check:</b> {escape(api_valid_display)}\n"
         f"<b>Requests remaining:</b> {remaining_display}\n"
         f"<b>Requests used:</b> {api_status['used'] or 'unknown'}\n"
-        "<b>— Last generation —</b>\n"
+        "<b>— Odds providers —</b>\n"
+        + "\n".join(_provider_status_lines())
+        + "\n<b>— Last generation —</b>\n"
     )
     if gen_stats:
         message += (
@@ -488,7 +527,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"<b>No bookmakers:</b> {gen_stats.get('events_no_bookmakers', 0)}\n"
             f"<b>Passed consensus eval:</b> {gen_stats.get('candidates', 0)}\n"
             f"<b>Final predictions:</b> {gen_stats.get('returned', 0)}\n"
-            f"<b>League errors:</b> {gen_stats.get('errors', 0)}\n"
+            f"<b>Errors:</b> {gen_stats.get('errors', 0)}\n"
             f"<b>Fallback floor applied:</b> "
             f"{'Yes' if gen_stats.get('fallback_applied') else 'No'}\n"
         )
@@ -508,13 +547,17 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"<b>Settled predictions:</b> {tracking_health['settled']}\n"
         f"<b>Last score fetch:</b> {tracking_health['last_score_fetch']}"
     )
-    await update.message.reply_text(message, parse_mode="HTML")
+    output, is_file = safe_message(message)
+    if is_file:
+        await update.effective_message.reply_document(document=output, caption="🩺 Bot status")
+    else:
+        await update.effective_message.reply_text(output, parse_mode="HTML")
 
 
 def _is_admin(update: Update) -> bool:
     """Check whether the command caller is the configured admin."""
     user = update.effective_user
-    return (
+    return bool(
         user is not None
         and config.ADMIN_CHAT_ID
         and user.id == config.ADMIN_CHAT_ID
@@ -528,13 +571,13 @@ async def force_refresh_cache(update: Update, context: ContextTypes.DEFAULT_TYPE
     the midnight (Lagos) cache rollover.
     """
     if not _is_admin(update):
-        await update.message.reply_text(
+        await update.effective_message.reply_text(
             "⛔ This command is restricted to the bot administrator."
         )
         return
 
-    loading = await update.message.reply_text(
-        "🔄 Clearing today's cache and re-fetching odds from the API..."
+    loading = await update.effective_message.reply_text(
+        "🔄 Clearing today's cache and re-fetching odds..."
     )
 
     # 1. Drop in-memory prediction cache so a fresh fetch is triggered
@@ -542,7 +585,7 @@ async def force_refresh_cache(update: Update, context: ContextTypes.DEFAULT_TYPE
     _cached_predictions = None
     _cached_date = None
 
-    # 2. Delete today's on-disk cache file
+    # 2. Delete today's on-disk cache file (and any fetch-failure cooldown)
     removed = clear_today_cache()
     log.info("Admin force-refresh: cache file removed=%s", removed)
 
@@ -554,6 +597,7 @@ async def force_refresh_cache(update: Update, context: ContextTypes.DEFAULT_TYPE
         await loading.edit_text(f"❌ Force refresh failed: {escape(str(e))}")
         return
 
+    providers = "\n".join(_provider_status_lines())
     if predictions:
         preview = "\n".join(
             f"• {escape(p['match'])} — {escape(p['pick'])} "
@@ -562,53 +606,31 @@ async def force_refresh_cache(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
         await loading.edit_text(
             f"✅ Cache refreshed — {len(predictions)} predictions regenerated.\n\n"
-            f"<b>Top picks preview:</b>\n{preview}",
+            f"<b>Top picks preview:</b>\n{preview}\n\n"
+            f"<b>Providers:</b>\n{providers}",
             parse_mode="HTML",
         )
     else:
-        # Credits available but nothing generated — report the exact reason.
+        # Nothing generated — report the exact reason.
         quota = odds_client.get_last_quota()
-        gen_stats = predictions.get_last_generation_stats()
+        gen_stats = get_last_generation_stats()
         reason = gen_stats.get(
             "reason_zero", "no specific reason recorded — check bot logs"
         )
-        api_note = ""
-        try:
-            api_status = odds_client.check_api_key()
-            if not api_status["valid"]:
-                api_note = (
-                    f"\n<b>⚠️ API key problem:</b> {escape(api_status['error'])}"
-                )
-            elif api_status["remaining"] is not None and int(
-                api_status["remaining"]
-            ) == 0:
-                api_note = (
-                    "\n<b>🔴 [CRITICAL] Odds API quota exhausted "
-                    "(0 requests remaining)</b>"
-                )
-            else:
-                api_note = (
-                    f"\n<b>API credits:</b> {api_status['remaining']} requests "
-                    "remaining — key is valid."
-                )
-        except Exception as e:  # noqa: BLE001
-            api_note = f"\n<b>API check failed:</b> {escape(str(e))}"
-
         await loading.edit_text(
             "⚠️ Cache cleared but 0 predictions generated.\n"
-            f"<b>Reason:</b> {escape(reason)}"
-            f"{api_note}\n\n"
+            f"<b>Reason:</b> {escape(reason)}\n\n"
+            f"<b>Providers:</b>\n{providers}\n\n"
             f"<b>Generation stats:</b> raw={gen_stats.get('raw_events', 0)}, "
             f"today={gen_stats.get('events_today', 0)}, "
             f"consensus={gen_stats.get('candidates', 0)}, "
-            f"quota_remaining={quota.get('remaining', 'unknown')}",
+            f"odds_api_quota_remaining={quota.get('remaining', 'unknown')}",
             parse_mode="HTML",
         )
 
 
 # ============================================================================
 # Callback Query Handlers
-
 # ============================================================================
 
 
@@ -617,7 +639,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
-    data = query.data
+    data = query.data or ""
 
     # No-op button (page indicator)
     if data == "noop":
@@ -625,8 +647,11 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Parse callback data
     parts = data.split(":")
+    if len(parts) != 3 or not parts[2].isdigit():
+        log.warning("Ignoring unrecognised callback data %r", data)
+        return
 
-        # Handle "top:p:X" — paginated all-picks accumulator
+    # Handle "top:p:X" — paginated all-picks accumulator
     if parts[0] == "top" and parts[1] == "p":
         page = int(parts[2])
         predictions = await get_today_predictions()
@@ -697,59 +722,101 @@ async def send_filtered_predictions(
 # ============================================================================
 
 
+def _today_lagos_str() -> str:
+    """Today's Africa/Lagos date as ``YYYY-MM-DD`` (the broadcast schedule's day)."""
+    return datetime.now(LAGOS_TZ).strftime("%Y-%m-%d")
+
+
+def _broadcast_time_today() -> datetime:
+    """Today's scheduled broadcast moment in Africa/Lagos time."""
+    hour, minute = map(int, config.DAILY_BROADCAST_TIME.split(":"))
+    return datetime.now(LAGOS_TZ).replace(hour=hour, minute=minute, second=0, microsecond=0)
+
+
+async def _send_broadcast_message(context: ContextTypes.DEFAULT_TYPE, chat_id: int, text: str) -> str:
+    """Send one broadcast message. Returns "sent", "gone" (chat unreachable) or "failed"."""
+    for attempt in range(2):
+        try:
+            await context.bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML")
+            return "sent"
+        except RetryAfter as e:
+            if attempt:
+                break
+            wait = e.retry_after
+            wait = wait.total_seconds() if isinstance(wait, timedelta) else float(wait)
+            log.warning(f"Telegram flood limit; retrying {chat_id} in {wait:.0f}s")
+            await asyncio.sleep(wait)
+        except Forbidden as e:
+            log.info(f"Chat {chat_id} blocked the bot: {e}")
+            return "gone"
+        except BadRequest as e:
+            if "chat not found" in str(e).lower():
+                log.info(f"Chat {chat_id} no longer exists: {e}")
+                return "gone"
+            log.warning(f"Failed to send broadcast to {chat_id}: {e}")
+            return "failed"
+        except TelegramError as e:
+            log.warning(f"Failed to send broadcast to {chat_id}: {e}")
+            return "failed"
+    return "failed"
+
+
 async def daily_broadcast(context: ContextTypes.DEFAULT_TYPE):
-    """Send daily broadcast to all subscribers."""
-    today_utc_str = _today_utc_str()
+    """Send the daily broadcast to every subscriber, at most once per Lagos day.
+
+    One subscriber failing never stops delivery to the rest. Chats that
+    blocked the bot or no longer exist are unsubscribed.
+    """
+    today = _today_lagos_str()
+    if tracking.has_daily_broadcast_run(today):
+        log.info(f"Daily broadcast already sent for {today}; skipping")
+        return
+    # Claim the day first so a restart mid-broadcast cannot send it twice.
+    tracking.mark_daily_broadcast_run(today)
+
     chat_ids = get_all_chat_ids()
     if not chat_ids:
         log.info("No subscribers for daily broadcast")
-        tracking.mark_daily_broadcast_run(today_utc_str)
         return
 
     predictions = await get_today_predictions()
     top = get_top_picks(predictions, count=config.DAILY_PICK_COUNT)
 
-    if not top:
-        # Send empty state message to all subscribers
-        for chat_id in chat_ids:
-            try:
-                await context.bot.send_message(
-                    chat_id=chat_id,
-                    text="⚠️ No predictions available for today's matches. Check back tomorrow morning!",
-                    parse_mode="HTML",
-                )
-            except TelegramError as e:
-                log.warning(f"Failed to send broadcast to {chat_id}: {e}")
-        log.warning("No predictions available for daily broadcast - sent empty state to subscribers")
-        tracking.mark_daily_broadcast_run(today_utc_str)
-        return
+    if top:
+        msg = format_top_picks(top, count=config.DAILY_PICK_COUNT)
+        msg += "\n\n<i>Use /dailypick for detailed view or /toppicks for all predictions</i>"
+    else:
+        msg = _EMPTY_STATE_MESSAGE
+        log.warning("No predictions available for daily broadcast - sending empty state to subscribers")
 
-    msg = format_top_picks(top, count=config.DAILY_PICK_COUNT)
-    msg += "\n\n<i>Use /dailypick for detailed view or /toppicks for all predictions</i>"
-
-    sent = 0
-    failed = 0
-
+    sent = failed = unsubscribed = 0
     for chat_id in chat_ids:
-        try:
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=msg,
-                parse_mode="HTML",
-            )
-            tracking.record_predictions(top, chat_id)
+        outcome = await _send_broadcast_message(context, chat_id, msg)
+        if outcome == "sent":
             sent += 1
-        except TelegramError as e:
-            log.warning(f"Failed to send broadcast to {chat_id}: {e}")
+            if top:
+                try:
+                    tracking.record_predictions(top, chat_id)
+                except sqlite3.Error as e:
+                    log.error(f"Failed to record broadcast delivery for {chat_id}: {e}")
+        elif outcome == "gone":
+            remove_subscriber(chat_id)
+            unsubscribed += 1
+        else:
             failed += 1
+        # Stay well under Telegram's ~30 messages/second limit
+        await asyncio.sleep(0.05)
 
-    log.info(f"Daily broadcast sent: {sent} success, {failed} failed")
-    tracking.mark_daily_broadcast_run(today_utc_str)
+    log.info(
+        f"Daily broadcast sent: {sent} success, {failed} failed, "
+        f"{unsubscribed} unsubscribed"
+    )
 
 
 async def settlement_job(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Run the non-blocking pending-prediction settlement check."""
+    """Settle finished predictions and prune old odds cache files."""
     await settle_pending_predictions()
+    await asyncio.to_thread(cleanup_old_cache)
 
 
 # ============================================================================
@@ -768,15 +835,16 @@ async def log_handler_error(update: object, context: ContextTypes.DEFAULT_TYPE):
         exc_info=context.error,
     )
     try:
-        if isinstance(update, Update) and update.effective_message:
+        if isinstance(update, Update):
+            chat = update.effective_chat
             origin = ""
             if update.callback_query and update.callback_query.data:
                 origin = f" callback={update.callback_query.data!r}"
             elif update.effective_message:
                 text = update.effective_message.text or ""
                 origin = f" message={text[:60]!r}"
-            log.error(f"  from chat_id={chat.id if chat else '?'} ... {origin}")
-    except Exception:
+            log.error(f"  from chat_id={chat.id if chat else '?'}{origin}")
+    except Exception:  # noqa: BLE001 — logging context must never raise
         pass
     # Users never see error details — the failure is logged for the admin
     # and surfaced later via /status. The handler simply stays silent.
@@ -805,66 +873,50 @@ async def _warm_daily_cache_background() -> None:
         log.error("[CACHE] Background daily odds cache population failed: %r", exc)
 
 
-def _schedule_cache_warmup() -> None:
-    """Kick off the deferred cache population as a non-blocking task."""
-    task = asyncio.create_task(_warm_daily_cache_background())
+def _schedule_background(coro) -> None:
+    """Run a coroutine as a tracked fire-and-forget task."""
+    task = asyncio.create_task(coro)
     _BACKGROUND_TASKS.add(task)
     task.add_done_callback(_BACKGROUND_TASKS.discard)
 
 
-def _today_utc_str() -> str:
-    """Today's date as a UTC ``YYYY-MM-DD`` string."""
-    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+def _schedule_cache_warmup() -> None:
+    """Kick off the deferred cache population as a non-blocking task."""
+    _schedule_background(_warm_daily_cache_background())
 
 
 async def _check_missed_broadcast(app) -> None:
-    """Catch up on today's daily broadcast if it was missed while the bot was down.
+    """Send today's broadcast if its scheduled time passed while the bot was down.
 
-    Runs ~5 seconds after polling is active so boot stays fast. The catch-up is
-    scheduled through the JobQueue (which supplies a real callback context) and
-    therefore executes asynchronously without blocking the event loop.
+    Runs ~5 seconds after polling is active so boot stays fast. Does nothing
+    before today's broadcast time or when today's broadcast already went out;
+    daily_broadcast itself is idempotent per Lagos day.
     """
     try:
         await asyncio.sleep(5)
-        today_utc_str = _today_utc_str()
-        if tracking.has_daily_broadcast_run(today_utc_str):
-            log.info(
-                f"[STARTUP] Daily broadcast already completed for {today_utc_str}. "
-                "Skipping catch-up."
-            )
+        today = _today_lagos_str()
+        if datetime.now(LAGOS_TZ) < _broadcast_time_today():
+            log.info("[STARTUP] Today's broadcast is not due yet; no catch-up needed.")
             return
-
-        log.info(
-            f"[STARTUP] Missed scheduled daily broadcast for {today_utc_str}. "
-            "Triggering catch-up broadcast now..."
-        )
-        if app.job_queue is not None:
-            app.job_queue.run_once(
-                daily_broadcast, when=0, name="catchup_daily_broadcast"
-            )
-            # Idempotent: prevents duplicate/infinite catch-up across restarts.
-            tracking.mark_daily_broadcast_run(today_utc_str)
-        else:
-            # No JobQueue exists (so the original broadcast was never scheduled);
-            # record the date so we do not attempt a looping catch-up, and warn.
-            tracking.mark_daily_broadcast_run(today_utc_str)
-            log.warning(
-                "[STARTUP] Job queue unavailable — could not schedule catch-up "
-                "daily broadcast."
-            )
+        if tracking.has_daily_broadcast_run(today):
+            log.info(f"[STARTUP] Daily broadcast already completed for {today}.")
+            return
+        if app.job_queue is None:
+            log.warning("[STARTUP] Job queue unavailable — cannot send catch-up broadcast.")
+            return
+        log.info(f"[STARTUP] Missed today's broadcast ({today}); sending it now.")
+        app.job_queue.run_once(daily_broadcast, when=0, name="catchup_daily_broadcast")
     except Exception as exc:  # noqa: BLE001 — catch-up must never crash the bot
         log.error("[STARTUP] Catch-up broadcast check failed: %r", exc)
 
 
-def _schedule_missed_broadcast_check(app) -> None:
-    """Kick off the deferred missed-broadcast check as a non-blocking task."""
-    task = asyncio.create_task(_check_missed_broadcast(app))
-    _BACKGROUND_TASKS.add(task)
-    task.add_done_callback(_BACKGROUND_TASKS.discard)
-
-
 async def run_bot() -> None:
     """Start the bot and shut it down cleanly on termination signals."""
+    global _prediction_lock
+    # asyncio locks bind to the event loop that first waits on them, and
+    # main() starts a fresh loop after every restart.
+    _prediction_lock = asyncio.Lock()
+
     startup_started = time.perf_counter()
     # Configure longer network timeouts so the bot survives slow connections
     # instead of failing with a TimedOut during get_me / start_polling.
@@ -900,14 +952,6 @@ async def run_bot() -> None:
                 ),
             )
 
-    # Cache warming is DEFERRED to a background task that runs only after the
-    # bot is already polling, so the app never blocks startup (or requests) on
-    # the external odds fetch.
-    log.info(
-        "Daily odds cache warm-up deferred to a non-blocking background task "
-        "after the bot starts polling."
-    )
-
     # Command handlers
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
@@ -916,6 +960,7 @@ async def run_bot() -> None:
     app.add_handler(CommandHandler("top", toppicks))
     app.add_handler(CommandHandler("sports", sports_filter))
     app.add_handler(CommandHandler("stats", stats_command))
+    app.add_handler(CommandHandler(["stop", "unsubscribe"], stop_command))
     app.add_handler(CommandHandler("status", status_command))
     app.add_handler(CommandHandler("force_refresh_cache", force_refresh_cache))
 
@@ -932,7 +977,6 @@ async def run_bot() -> None:
         # explicitly, so container/host timezone (e.g. UTC on Railway) does
         # not shift the daily delivery time.
         hour, minute = map(int, config.DAILY_BROADCAST_TIME.split(":"))
-        from datetime import time as dt_time
 
         app.job_queue.run_daily(
             daily_broadcast,
@@ -975,9 +1019,10 @@ async def run_bot() -> None:
             await asyncio.sleep(wait)
 
     # Polling is active — start the deferred, non-blocking cache warm-up and
-    # report startup time. This runs in the background and never holds up any
-    # Telegram command handler.
+    # the missed-broadcast check. Neither holds up any command handler.
     _schedule_cache_warmup()
+    if app.job_queue:
+        _schedule_background(_check_missed_broadcast(app))
     log.info(
         "[STARTUP] Bot initialized and polling active in %.2f seconds.",
         time.perf_counter() - startup_started,
@@ -987,6 +1032,8 @@ async def run_bot() -> None:
         await shutdown_event.wait()
     finally:
         log.info("Stopping Telegram polling and scheduled jobs")
+        for task in list(_BACKGROUND_TASKS):
+            task.cancel()
         await app.updater.stop()
         await app.stop()
         await app.shutdown()
@@ -998,14 +1045,15 @@ def main() -> None:
 
     Transient network loss or a Telegram outage previously killed the
     process permanently (Railway then sat idle until manually restarted).
-    Now the lifecycle is retried indefinitely with a capped backoff so the
-    bot recovers on its own. A Telegram 'Conflict' (two instances polling
-    with the same token) is retried on a longer delay because it usually
-    means the old container has not fully terminated yet.
+    Now the lifecycle is retried indefinitely with a capped exponential
+    backoff that resets after a healthy run. A Telegram 'Conflict' (two
+    instances polling with the same token) is retried on a longer delay
+    because it usually means the old container has not terminated yet.
     """
     delay = 10
     while True:
-        wait = delay
+        started = time.monotonic()
+        wait = None
         try:
             asyncio.run(run_bot())
             log.info("Bot lifecycle ended cleanly")
@@ -1018,25 +1066,19 @@ def main() -> None:
                 # Another instance is polling with this token (e.g. the
                 # previous Railway container has not terminated yet).
                 wait = 60
-                log.error(
-                    f"Telegram Conflict (another instance polling?): {exc!r}; "
-                    f"retrying in {wait}s"
-                )
+                log.error(f"Telegram Conflict (another instance polling?): {exc!r}")
             else:
-                log.error(
-                    f"Telegram error ended the bot lifecycle: {exc!r}; "
-                    f"restarting in {wait}s"
-                )
+                log.error(f"Telegram error ended the bot lifecycle: {exc!r}")
         except Exception:
-            log.exception(
-                f"Unexpected fatal error ended the bot lifecycle; "
-                f"restarting in {wait}s"
-            )
+            log.exception("Unexpected fatal error ended the bot lifecycle")
+
+        if time.monotonic() - started > 600:
+            delay = 10  # The last run was healthy for a while; back off from scratch
+        wait = wait or delay
+        log.info(f"Restarting the bot in {wait}s")
         time.sleep(wait)
-        delay = min(max(delay * 2, 10), 300)
-        wait = min(wait, delay)
+        delay = min(delay * 2, 300)
 
 
 if __name__ == "__main__":
     main()
-

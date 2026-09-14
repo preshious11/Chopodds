@@ -4,13 +4,16 @@ import json
 import logging
 import sqlite3
 import uuid
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 from threading import Lock
+from typing import Iterator
 from zoneinfo import ZoneInfo
 
+import config
+
 logger = logging.getLogger(__name__)
-DB_PATH = Path(__file__).resolve().parent / "prediction_tracking.db"
+DB_PATH = config.DATA_DIR / "prediction_tracking.db"
 _DB_LOCK = Lock()
 
 # Default time window used by the settlement engine: only poll matches that
@@ -18,16 +21,30 @@ _DB_LOCK = Lock()
 # it is past the upper bound (stale matches are never polled indefinitely).
 DEFAULT_MIN_ELAPSED_MINUTES = 110
 DEFAULT_MAX_ELAPSED_HOURS = 14
+# Pending picks older than this (from kick-off, or from when they were
+# recorded if the kick-off is unknown) can no longer be settled and are voided.
+STALE_PENDING_HOURS = 24
 
 LAGOS_TZ = ZoneInfo("Africa/Lagos")
 _MEMORY_CONNECTION: sqlite3.Connection | None = None
+
+# Columns added after the initial release, migrated onto existing databases.
+_ADDED_COLUMNS = (
+    "commence_time TEXT",
+    "home_team TEXT",
+    "away_team TEXT",
+    "market_type TEXT",
+    "sport TEXT",
+    "league TEXT",
+    "source TEXT",
+)
 
 
 def _connect() -> sqlite3.Connection:
     global _MEMORY_CONNECTION
     if str(DB_PATH) == ":memory:":
         if _MEMORY_CONNECTION is None:
-            _MEMORY_CONNECTION = sqlite3.connect(":memory:")
+            _MEMORY_CONNECTION = sqlite3.connect(":memory:", check_same_thread=False)
             _MEMORY_CONNECTION.row_factory = sqlite3.Row
         return _MEMORY_CONNECTION
     connection = sqlite3.connect(DB_PATH, check_same_thread=False)
@@ -35,9 +52,22 @@ def _connect() -> sqlite3.Connection:
     return connection
 
 
+@contextmanager
+def _session() -> Iterator[sqlite3.Connection]:
+    """Serialized connection that commits on success and is always closed."""
+    with _DB_LOCK:
+        connection = _connect()
+        try:
+            with connection:
+                yield connection
+        finally:
+            if connection is not _MEMORY_CONNECTION:
+                connection.close()
+
+
 def initialize() -> None:
     """Create the prediction audit schema if it does not exist."""
-    with _DB_LOCK, _connect() as connection:
+    with _session() as connection:
         connection.executescript(
             """
             CREATE TABLE IF NOT EXISTS predictions (
@@ -80,15 +110,9 @@ def _ensure_schema_columns(connection: sqlite3.Connection) -> None:
     """Add columns introduced after the initial release to pre-existing tables.
 
     Safe no-op when a column is already present. Keeps databases created before
-    the time-aware settlement engine (and home/away/market_type storage) on the
-    new schema without forcing users to wipe their tracking DB.
+    the time-aware settlement engine on the new schema without forcing users
+    to wipe their tracking DB.
     """
-    _ADDED_COLUMNS = (
-        "commence_time TEXT",
-        "home_team TEXT",
-        "away_team TEXT",
-        "market_type TEXT",
-    )
     existing = {
         row[1] for row in connection.execute("PRAGMA table_info(predictions)").fetchall()
     }
@@ -99,18 +123,27 @@ def _ensure_schema_columns(connection: sqlite3.Connection) -> None:
             logger.info("Migration: added %s column to predictions table.", name)
 
 
+def _ensure_indexes(connection: sqlite3.Connection) -> None:
+    """Create indexes that speed up the settlement and stats queries."""
+    connection.executescript(
+        """
+        CREATE INDEX IF NOT EXISTS idx_predictions_status ON predictions(status);
+        CREATE INDEX IF NOT EXISTS idx_predictions_event_id ON predictions(event_id);
+        CREATE INDEX IF NOT EXISTS idx_predictions_prediction_id ON predictions(prediction_id);
+        CREATE INDEX IF NOT EXISTS idx_deliveries_user_id ON deliveries(user_id);
+        """
+    )
+
+
 def _broadcast_key(date_str: str) -> str:
     """Return the metadata key that records a completed daily broadcast run."""
     return f"daily_broadcast:{date_str}"
 
 
 def has_daily_broadcast_run(date_str: str) -> bool:
-    """Return True if the daily broadcast already ran on the given UTC date.
-
-    ``date_str`` is a UTC date in ``YYYY-MM-DD`` format.
-    """
+    """Return True if the daily broadcast already ran on the given date (``YYYY-MM-DD``)."""
     initialize()
-    with _DB_LOCK, _connect() as connection:
+    with _session() as connection:
         row = connection.execute(
             "SELECT value FROM metadata WHERE key = ?", (_broadcast_key(date_str),)
         ).fetchone()
@@ -118,9 +151,9 @@ def has_daily_broadcast_run(date_str: str) -> bool:
 
 
 def mark_daily_broadcast_run(date_str: str) -> None:
-    """Record that the daily broadcast ran on the given UTC date (``YYYY-MM-DD``)."""
+    """Record that the daily broadcast ran on the given date (``YYYY-MM-DD``)."""
     initialize()
-    with _DB_LOCK, _connect() as connection:
+    with _session() as connection:
         connection.execute(
             "INSERT OR REPLACE INTO metadata (key, value) VALUES (?, ?)",
             (_broadcast_key(date_str), date_str),
@@ -185,7 +218,7 @@ def _resolve_commence_time(prediction: dict) -> str | None:
     """Return the UTC kick-off (``commence_time``) ISO string for a prediction.
 
     Precedence:
-      1. explicit ``commence_time`` (raw event UTC from the Odds API),
+      1. explicit ``commence_time`` (raw event UTC from the odds feed),
       2. ``kickoff_utc`` when it is a full UTC timestamp,
       3. reconstruct from Lagos ``match_date`` + ``match_time``.
     Returns None when no UTC kick-off can be determined.
@@ -212,34 +245,35 @@ def record_predictions(predictions: list[dict], user_id: int | None = None) -> N
     event selected for both the standard match predictions and featured/daily
     slips is stored once under a single authoritative prediction_id.
 
-    The UTC ``commence_time`` (kick-off timestamp) is stored for every pick so
-    the settlement engine can time-gate when a match is eligible for polling.
+    Everything settlement needs to grade a pick is stored: UTC kick-off,
+    teams, market, sport, sport key and the provider that supplied the odds.
     """
+    if not predictions:
+        return
     initialize()
     now = datetime.now(timezone.utc).isoformat()
     deduped = _dedupe_predictions_by_event(predictions)
-    with _DB_LOCK, _connect() as connection:
+    with _session() as connection:
         for prediction in deduped:
             event_id = str(prediction.get("event_id") or prediction.get("match"))
             if not event_id:
                 continue
             prediction_id = _prediction_id(event_id)
-            commence_time = _resolve_commence_time(prediction)
             connection.execute(
                 """
                 INSERT OR IGNORE INTO predictions (
                     prediction_id, event_id, match_name, sport_key, kickoff_time,
                     commence_time, home_team, away_team, market_type, selection,
-                    confidence_score, odds, created_timestamp
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    confidence_score, odds, created_timestamp, sport, league, source
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     prediction_id,
                     event_id,
                     prediction.get("match", "Unknown match"),
-                    prediction.get("sport_key", prediction.get("league", "")),
+                    prediction.get("sport_key") or prediction.get("league") or "",
                     prediction.get("kickoff_utc") or prediction.get("match_time"),
-                    commence_time,
+                    _resolve_commence_time(prediction),
                     prediction.get("home_team"),
                     prediction.get("away_team"),
                     prediction.get("market_type"),
@@ -247,6 +281,9 @@ def record_predictions(predictions: list[dict], user_id: int | None = None) -> N
                     prediction.get("confidence", 0),
                     prediction.get("odds", 0),
                     now,
+                    prediction.get("sport"),
+                    prediction.get("league"),
+                    prediction.get("source"),
                 ),
             )
             if user_id is None:
@@ -271,7 +308,7 @@ def record_predictions(predictions: list[dict], user_id: int | None = None) -> N
 def get_pending_predictions() -> list[dict]:
     """Return pending predictions with their stored delivery recipients."""
     initialize()
-    with _DB_LOCK, _connect() as connection:
+    with _session() as connection:
         rows = connection.execute(
             "SELECT * FROM predictions WHERE status = 'PENDING'"
         ).fetchall()
@@ -290,7 +327,7 @@ def get_eligible_pending_predictions(
 
     i.e. the match has kicked off more than ``min_elapsed_minutes`` ago (so an
     outcome is likely known) but is not so stale that polling it would waste
-    Odds API credits. Pending picks without a parseable ``commence_time`` are
+    API credits. Pending picks without a parseable ``commence_time`` are
     excluded (and logged) because they cannot be time-gated safely.
 
     ``now`` is injectable for deterministic tests; defaults to UTC now.
@@ -303,9 +340,10 @@ def get_eligible_pending_predictions(
     earliest = now - timedelta(hours=DEFAULT_MAX_ELAPSED_HOURS)
     latest = now - timedelta(minutes=min_elapsed_minutes)
 
+    initialize()
     eligible: list[dict] = []
     missing = 0
-    with _DB_LOCK, _connect() as connection:
+    with _session() as connection:
         rows = connection.execute(
             """
             SELECT * FROM predictions
@@ -314,13 +352,13 @@ def get_eligible_pending_predictions(
             ORDER BY commence_time ASC
             """
         ).fetchall()
-        for row in rows:
-            commence = _parse_utc(row["commence_time"])
-            if commence is None:
-                missing += 1
-                continue
-            if earliest <= commence <= latest:
-                eligible.append(dict(row))
+    for row in rows:
+        commence = _parse_utc(row["commence_time"])
+        if commence is None:
+            missing += 1
+            continue
+        if earliest <= commence <= latest:
+            eligible.append(dict(row))
 
     if missing:
         logger.warning(
@@ -331,12 +369,49 @@ def get_eligible_pending_predictions(
     return eligible
 
 
+def void_stale_pending(
+    max_age_hours: int = STALE_PENDING_HOURS,
+    now: datetime | None = None,
+) -> int:
+    """Void pending picks that can no longer be settled. Returns how many.
+
+    A pick is stale once its kick-off (or, when unknown, the time it was
+    recorded) is more than ``max_age_hours`` ago — past the settlement
+    polling window, so no result will ever be applied to it.
+    """
+    now = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    cutoff = now - timedelta(hours=max_age_hours)
+    initialize()
+    voided = 0
+    with _session() as connection:
+        rows = connection.execute(
+            "SELECT prediction_id, commence_time, created_timestamp "
+            "FROM predictions WHERE status = 'PENDING'"
+        ).fetchall()
+        for row in rows:
+            reference = _parse_utc(row["commence_time"]) or _parse_utc(row["created_timestamp"])
+            if reference is None or reference >= cutoff:
+                continue
+            cursor = connection.execute(
+                """
+                UPDATE predictions
+                SET status = 'VOID', settlement_result = 'void', settled_timestamp = ?
+                WHERE prediction_id = ? AND status = 'PENDING'
+                """,
+                (now.isoformat(), row["prediction_id"]),
+            )
+            voided += cursor.rowcount
+    if voided:
+        logger.info("Voided %d stale pending pick(s) that could not be settled", voided)
+    return voided
+
+
 def settle_prediction(prediction_id: str, status: str) -> bool:
     """Settle a pending record exactly once."""
     if status not in {"SETTLED_WIN", "SETTLED_LOSS", "VOID"}:
         return False
     initialize()
-    with _DB_LOCK, _connect() as connection:
+    with _session() as connection:
         cursor = connection.execute(
             """
             UPDATE predictions
@@ -360,7 +435,7 @@ def get_global_stats() -> dict:
     - ``win_rate`` = wins / settled games * 100 (0.0 when nothing settled).
     """
     initialize()
-    with _DB_LOCK, _connect() as connection:
+    with _session() as connection:
         row = connection.execute(
             """
             SELECT
@@ -398,7 +473,7 @@ def get_user_stats(user_id: int, joined_at: datetime | None = None) -> dict:
     """
     initialize()
     joined_iso = joined_at.astimezone(timezone.utc).isoformat() if joined_at else ""
-    with _DB_LOCK, _connect() as connection:
+    with _session() as connection:
         row = connection.execute(
             """
             SELECT
@@ -433,7 +508,7 @@ def get_user_stats(user_id: int, joined_at: datetime | None = None) -> dict:
 def get_health_metrics() -> dict:
     """Return pending/settled counts and the last score-fetch timestamp."""
     initialize()
-    with _DB_LOCK, _connect() as connection:
+    with _session() as connection:
         pending = connection.execute(
             "SELECT COUNT(*) FROM predictions WHERE status = 'PENDING'"
         ).fetchone()[0]
@@ -446,23 +521,10 @@ def get_health_metrics() -> dict:
     return {"pending": pending, "settled": settled, "last_score_fetch": row[0] if row else "never"}
 
 
-
-
-def _ensure_indexes(connection: sqlite3.Connection) -> None:
-    """Create indexes that speed up the settlement and stats queries."""
-    connection.executescript(
-        """
-        CREATE INDEX IF NOT EXISTS idx_predictions_status ON predictions(status);
-        CREATE INDEX IF NOT EXISTS idx_predictions_event_id ON predictions(event_id);
-        CREATE INDEX IF NOT EXISTS idx_predictions_prediction_id ON predictions(prediction_id);
-        CREATE INDEX IF NOT EXISTS idx_deliveries_user_id ON deliveries(user_id);
-        """
-    )
-
 def set_last_score_fetch() -> None:
     """Record a successful score-fetch completion timestamp."""
     initialize()
-    with _DB_LOCK, _connect() as connection:
+    with _session() as connection:
         connection.execute(
             "INSERT OR REPLACE INTO metadata(key, value) VALUES ('last_score_fetch', ?)",
             (datetime.now(timezone.utc).isoformat(),),

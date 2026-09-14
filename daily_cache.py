@@ -1,27 +1,42 @@
 """
 Shared daily cache for odds data based on Africa/Lagos timezone.
 
-Ensures only one API call per day across all users, even with concurrent
+Ensures only one API fetch per day across all users, even with concurrent
 requests. The cache is file-persisted so it survives bot restarts.
 
 At midnight Lagos time, the cache automatically expires because the date
-changes and a new cache file is created. Old cache files are kept for
-historical reference and cleaned up after configurable retention period.
+changes and a new cache file is created. Old cache files are removed after
+a retention period by cleanup_old_cache().
 """
 
 import json
 import logging
+import re
+import time
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from threading import Lock
+from typing import Callable
 
 from zoneinfo import ZoneInfo
+
+import config
 
 logger = logging.getLogger(__name__)
 
 LAGOS_TZ = ZoneInfo("Africa/Lagos")
-CACHE_DIR = Path(__file__).resolve().parent / ".daily_cache"
+CACHE_DIR = config.DATA_DIR / ".daily_cache"
 _LOCK = Lock()
+_CACHE_FILE_DATE = re.compile(r"^odds_(\d{4}-\d{2}-\d{2})\.json")
+
+# In-memory copy of today's odds, keyed by Lagos date string, so the one
+# read per league during generation does not re-parse the JSON file.
+_memory_cache: tuple[str, dict] | None = None
+
+# (monotonic time, exception) of the last failed fetch. Within
+# config.ODDS_FETCH_RETRY_COOLDOWN seconds callers get that error again
+# instead of triggering another full round of API requests.
+_last_failure: tuple[float, Exception] | None = None
 
 
 def get_lagos_date() -> date:
@@ -36,7 +51,7 @@ def get_lagos_date_str() -> str:
 
 def _get_cache_path(date_str: str = None) -> Path:
     """Get cache file path for a specific date (default: today Lagos)."""
-    CACHE_DIR.mkdir(exist_ok=True)
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
     if date_str is None:
         date_str = get_lagos_date_str()
     return CACHE_DIR / f"odds_{date_str}.json"
@@ -47,15 +62,18 @@ def get_cached_odds() -> dict:
     Get today's cached odds data for all sports.
     Returns a dict mapping sport_key -> odds_data.
     """
-    cache_path = _get_cache_path()
+    today = get_lagos_date_str()
+    if _memory_cache is not None and _memory_cache[0] == today:
+        return _memory_cache[1]
 
+    cache_path = _get_cache_path(today)
     if not cache_path.exists():
         return {}
 
     try:
         with open(cache_path, "r", encoding="utf-8") as f:
             data = json.load(f)
-        return data.get("sports", {})
+        return data.get("sports", {}) if isinstance(data, dict) else {}
     except (json.JSONDecodeError, OSError) as e:
         logger.warning(f"Failed to read daily cache: {e}")
         return {}
@@ -98,24 +116,26 @@ def validate_daily_cache() -> bool:
 
 def set_cached_odds(sports_data: dict) -> None:
     """
-    Store today's odds data for all sports.
+    Store today's odds data for all sports (in memory and on disk).
     sports_data: dict mapping sport_key -> odds_data
     """
-    cache_path = _get_cache_path()
+    global _memory_cache
+    today = get_lagos_date_str()
+    _memory_cache = (today, sports_data)
+    cache_path = _get_cache_path(today)
 
     try:
         with open(cache_path, "w", encoding="utf-8") as f:
             json.dump(
                 {
-                    "date": get_lagos_date_str(),
+                    "date": today,
                     "cached_at": datetime.now(LAGOS_TZ).isoformat(),
                     "sports": sports_data,
                 },
                 f,
             )
         logger.info(
-            f"Stored daily odds cache for {get_lagos_date_str()} "
-            f"with {len(sports_data)} sports"
+            f"Stored daily odds cache for {today} with {len(sports_data)} sports"
         )
     except OSError as e:
         logger.warning(f"Failed to write daily cache: {e}")
@@ -126,77 +146,86 @@ def is_cache_valid() -> bool:
     return validate_daily_cache()
 
 
-def ensure_populated(fetch_fn) -> dict:
-    """
-    Ensure the daily cache is populated. Thread-safe using double-checked
-    locking pattern — only the first concurrent caller triggers the fetch.
+def _raise_if_cooling_down() -> None:
+    """Re-raise the last fetch error while its retry cooldown is running."""
+    if _last_failure is None:
+        return
+    failed_at, error = _last_failure
+    remaining = config.ODDS_FETCH_RETRY_COOLDOWN - (time.monotonic() - failed_at)
+    if remaining > 0:
+        logger.info(
+            "Odds fetch failed recently; not retrying for another %ds", remaining
+        )
+        raise error.with_traceback(None)
 
-    IMPORTANT: an empty/failed fetch is NOT cached. If every sport returned
-    no data (e.g. invalid API key -> 401, rate limit -> 429, or network
-    outage), we return the empty result without persisting it so the very
-    next request retries the fetch instead of being locked out for the
-    whole day with "no predictions available".
+
+def ensure_populated(fetch_fn: Callable[[], dict]) -> dict:
+    """
+    Ensure the daily cache is populated. Thread-safe: only the first
+    concurrent caller triggers the fetch.
+
+    A fetch that raises (e.g. invalid API key, exhausted quota, outage) is
+    NOT cached and the error propagates. For the next
+    config.ODDS_FETCH_RETRY_COOLDOWN seconds the same error is raised again
+    without calling the API, so an outage cannot burn credits on every
+    user request; after that the next request retries.
 
     fetch_fn: callable that returns dict mapping sport_key -> odds_data
     Returns the cached sports data (dict of sport_key -> odds_data).
     """
-    # Fast path: check without acquiring lock
-    if is_cache_valid():
-        return get_cached_odds()
+    global _last_failure, _memory_cache
+    today = get_lagos_date_str()
+    if _memory_cache is not None and _memory_cache[0] == today:
+        return _memory_cache[1]
 
-    # Slow path: acquire lock and check again (double-checked locking)
     with _LOCK:
         # Another thread may have populated while we waited
+        if _memory_cache is not None and _memory_cache[0] == today:
+            return _memory_cache[1]
         if is_cache_valid():
-            return get_cached_odds()
+            sports_data = get_cached_odds()
+            _memory_cache = (today, sports_data)
+            return sports_data
+
+        _raise_if_cooling_down()
 
         # We are the first caller — fetch and populate
         logger.info("Populating daily odds cache (first request of the day)...")
-        # Local import to avoid a circular module-level dependency
-        # (odds_client imports daily_cache at module load time).
-        from odds_client import OddsAPIError
-
         try:
             sports_data = fetch_fn() or {}
-            total_events = sum(
-                len(events) if isinstance(events, list) else 0
-                for events in sports_data.values()
+        except Exception as exc:  # noqa: BLE001 — recorded for the cooldown, then re-raised
+            _last_failure = (time.monotonic(), exc)
+            logger.error(
+                "Daily odds fetch failed; not caching. Retrying no sooner than "
+                "%ds from now: %s", config.ODDS_FETCH_RETRY_COOLDOWN, exc,
             )
-            if not sports_data or total_events == 0:
-                # Do NOT cache an empty result — the next request will retry.
-                logger.warning(
-                    "Daily odds fetch returned NO data (%d sports, %d events); "
-                    "NOT caching empty result — next request will retry. "
-                    "Check ODDS_API_KEY validity (401) or rate limits (429).",
-                    len(sports_data), total_events,
-                )
-                return sports_data
+            raise
 
-            cache_path = _get_cache_path()
-            set_cached_odds(sports_data)
-            logger.info(
-                "Daily cache populated: %d raw matches fetched across %d sports "
-                "-> cache file: %s",
-                total_events, len(sports_data), cache_path,
-            )
-            return sports_data
-        except (ConnectionError, TimeoutError, OSError, OddsAPIError) as e:
-            # OddsAPIError covers the total-provider-outage case (every
-            # provider failed for every sport). Handle it like the other
-            # failure types: log, return whatever we have (possibly empty) and
-            # let the next user's request retry — never crash the request.
-            logger.error(f"Failed to populate daily cache: {e}")
-            # Return whatever we have (might be empty dict)
-            return get_cached_odds()
+        _last_failure = None
+        set_cached_odds(sports_data)
+        total_events = sum(
+            len(events) if isinstance(events, list) else 0
+            for events in sports_data.values()
+        )
+        logger.info(
+            "Daily cache populated: %d raw matches fetched across %d sports "
+            "-> cache file: %s",
+            total_events, len(sports_data), _get_cache_path(today),
+        )
+        return sports_data
 
 
 def clear_today_cache() -> bool:
     """
-    Delete today's cache file (if present) so the next request triggers a
-    fresh fetch. Used by the admin /force_refresh_cache command.
-    Returns True if a file was removed.
+    Delete today's cache (file and memory) and any fetch-failure cooldown so
+    the next request triggers a fresh fetch. Used by the admin
+    /force_refresh_cache command. Returns True if a file was removed.
     """
-    cache_path = _get_cache_path()
+    global _last_failure, _memory_cache
+    _memory_cache = None
+    _last_failure = None
+    today = get_lagos_date_str()
+    cache_path = _get_cache_path(today)
     removed = False
     if cache_path.exists():
         try:
@@ -206,7 +235,7 @@ def clear_today_cache() -> bool:
         except OSError as e:
             logger.error("Failed to clear cache file %s: %s", cache_path, e)
     # Also clear quarantined/corrupt variants for today so they cannot linger
-    for stale in CACHE_DIR.glob(f"odds_{get_lagos_date_str()}*.json"):
+    for stale in CACHE_DIR.glob(f"odds_{today}.json.corrupt-*"):
         try:
             stale.unlink()
             logger.info("Cleared stale cache artifact: %s", stale.name)
@@ -217,18 +246,18 @@ def clear_today_cache() -> bool:
 
 def cleanup_old_cache(keep_days: int = 30) -> None:
     """
-    Remove cache files older than keep_days.
-    Keeps historical records for the retention period, then deletes.
+    Remove cache files (including quarantined ones) older than keep_days.
     """
     if not CACHE_DIR.exists():
         return
 
     cutoff = get_lagos_date() - timedelta(days=keep_days)
-    for cache_file in CACHE_DIR.glob("odds_*.json"):
+    for cache_file in CACHE_DIR.glob("odds_*"):
+        match = _CACHE_FILE_DATE.match(cache_file.name)
+        if not match:
+            continue
         try:
-            date_str = cache_file.stem.replace("odds_", "")
-            file_date = date.fromisoformat(date_str)
-            if file_date < cutoff:
+            if date.fromisoformat(match.group(1)) < cutoff:
                 cache_file.unlink()
                 logger.info(f"Removed old cache file: {cache_file.name}")
         except (ValueError, OSError) as e:

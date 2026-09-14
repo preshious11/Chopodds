@@ -5,6 +5,7 @@ Clean, production-ready formatting without developer labels.
 
 import html
 import io
+import math
 from datetime import datetime
 
 from zoneinfo import ZoneInfo
@@ -44,17 +45,23 @@ def _confidence_tier_label(pred: dict) -> str:
     }.get(tier, tier or "Value")
 
 
+def _confidence_percent(confidence: float) -> int:
+    """Whole percent, rounded down so e.g. 49.6% never displays in the 50% tier."""
+    return math.floor(confidence * 100 + 1e-9)
+
+
 def format_single_prediction(pred: dict, index: int | None = None) -> str:
     """Format one prediction with compact match, selection, and timing copy."""
     prefix = f"{index}. " if index else ""
-    confidence_pct = int(pred["confidence"] * 100)
+    confidence_pct = _confidence_percent(pred["confidence"])
     confidence_emoji = _confidence_emoji(pred["confidence"])
     tier_label = _confidence_tier_label(pred)
+    odds_text = f"{pred['odds']}</b> (est.)" if pred.get("odds_estimated") else f"{pred['odds']}</b>"
 
     msg = (
         f"{prefix}{pred['sport_icon']} <b>{escape(pred['match'])}</b>\n"
         f"   Selection: <b>{escape(pred['pick'])}</b>\n"
-        f"   Odds: <b>{pred['odds']}</b> | Confidence: <b>{confidence_pct}%</b> {confidence_emoji} <b>{tier_label}</b>\n"
+        f"   Odds: <b>{odds_text} | Confidence: <b>{confidence_pct}%</b> {confidence_emoji} <b>{tier_label}</b>\n"
         f"   Kickoff: {escape(pred['match_time'])} · {escape(pred['league'])}\n"
     )
     return msg
@@ -119,7 +126,7 @@ def format_sport_filter_buttons(predictions: list) -> str:
         return "⚠️ <b>No predictions available for today. Check back tomorrow morning!</b>"
 
     sport_list = ", ".join(f"{icon} {name}" for name, icon in sports.items())
-    msg = f"⚽ <b>Select a sport to view today's predictions:</b>\n\n"
+    msg = "⚽ <b>Select a sport to view today's predictions:</b>\n\n"
     msg += f"<i>Available: {sport_list}</i>"
     return msg
 

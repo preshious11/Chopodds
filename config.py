@@ -12,6 +12,16 @@ env_path = Path(__file__).resolve().parent / ".env"
 if env_path.exists():
     load_dotenv(env_path)
 
+
+def _env_secret(*names: str) -> str | None:
+    """First non-empty value among ``names``, stripped of shell/dotenv quoting."""
+    for name in names:
+        value = os.environ.get(name, "").strip().strip('"\'').strip()
+        if value:
+            return value
+    return None
+
+
 # Get this from @BotFather on Telegram
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 if not TELEGRAM_BOT_TOKEN:
@@ -22,91 +32,55 @@ ODDS_API_KEY = os.environ.get("ODDS_API_KEY")
 if not ODDS_API_KEY:
     raise SystemExit("Set ODDS_API_KEY environment variable first.")
 
+# Directory for runtime state: odds cache, SQLite tracking DB, subscribers
+# and logs. On Railway, point this at a mounted volume — the container
+# filesystem is wiped on every redeploy.
+DATA_DIR = Path(
+    os.environ.get("DATA_DIR", "").strip() or Path(__file__).resolve().parent
+)
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+
 # ---------------------------------------------------------------------------
-# Multi-provider odds client (with automatic failover)
+# Odds providers (automatic failover)
 # ---------------------------------------------------------------------------
-# Length-1 list still works exactly like the single-provider setup today.
-# Add sportgameodds and sharpapi keys below; leave any out to disable that
-# provider. Each provider is tried in list order for every league; if one
-# returns a rate-limit/quota-exceeded error or times out, the next is tried
-# immediately. Providers that fail for a whole run are skipped for the rest
-# of today's scan so we do not keep retrying a dead/slow provider on every
-# league.
+# Tried in this order. Each provider only receives the leagues the previous
+# ones could not answer; a provider without an API key is skipped. The merged
+# result is cached once per Africa/Lagos day (daily_cache.py).
+ODDS_PROVIDER_ORDER = [
+    name.strip()
+    for name in os.environ.get(
+        "ODDS_PROVIDER_ORDER", "the-odds-api,sharpapi,sportsgameodds"
+    ).split(",")
+    if name.strip()
+]
+
+# Fallback provider keys. SPORTGAMEODDS_API_KEY (without the "S") is accepted
+# too, for deployments configured with that spelling.
+SHARPAPI_API_KEY = _env_secret("SHARPAPI_API_KEY")
+SHARPAPI_BASE_URL = os.environ.get("SHARPAPI_BASE_URL", "https://api.sharpapi.io/api/v1")
+SPORTSGAMEODDS_API_KEY = _env_secret("SPORTSGAMEODDS_API_KEY", "SPORTGAMEODDS_API_KEY")
+SPORTSGAMEODDS_BASE_URL = os.environ.get(
+    "SPORTSGAMEODDS_BASE_URL", "https://api.sportsgameodds.com/v2"
+)
+# Maximum pages read per fallback request (SharpAPI 200 rows/page,
+# SportsGameOdds 50 events/page).
+FALLBACK_MAX_PAGES = int(os.environ.get("FALLBACK_MAX_PAGES", "10"))
+
+# The Odds API
+# CREDIT COST WARNING: The Odds API charges #regions x #markets credits per
+# league request (requests returning no events are free). Defaults: 1 region
+# x 3 markets x ~12-14 in-season leagues = ~36-42 credits per daily fetch
+# (~1,100-1,300/month), above the free tier's 500/month. Off-season leagues
+# are skipped via the free /sports list. Settlement adds 2 credits per league
+# with finished pending picks. btts/double_chance are derived locally.
 ODDS_REGIONS = os.environ.get("ODDS_REGIONS", "uk")
 ODDS_MARKETS = os.environ.get("ODDS_MARKETS", "h2h,spreads,totals")
-ODDS_API_TIMEOUT_SECONDS = float(
-    os.environ.get("ODDS_API_TIMEOUT_SECONDS", "6")
-)
+ODDS_API_TIMEOUT_SECONDS = float(os.environ.get("ODDS_API_TIMEOUT_SECONDS", "10"))
 
-ODDS_API_PROVIDERS: list[dict] = [
-    {
-        "name": "the-odds-api",
-        "base_url": "https://api.the-odds-api.com/v4",
-        "api_key_env": "ODDS_API_KEY",
-        # the-odds-api style: GET /sports/{sport_key}/odds?apiKey=...
-        "auth_mode": "query",           # key passed as the "apiKey" query param
-        "odds_path": "/sports/{sport_key}/odds",
-        "response_wrapper": None,       # response body IS the events list
-    },
-    {
-        "name": "sharpapi",
-        # SharpAPI v1 (verified against https://docs.sharpapi.io, Sept 2026):
-        # base URL is https://api.sharpapi.io/api/v1 and the odds snapshot is
-        # GET /odds — NOT the-odds-api-style /sports/{key}/odds. Auth uses the
-        # X-API-Key header (an api_key query param also works). The /odds
-        # endpoint returns a flat, paginated list of odds rows under a
-        # "data" key, filtered by sport/league/market, so odds_client
-        # rebuilds the-odds-api-style event/bookmaker/market structure from
-        # those rows.
-        "base_url": os.environ.get(
-            "SHARPAPI_BASE_URL",
-            "https://api.sharpapi.io/api/v1",
-        ),
-        "api_key_env": "SHARPAPI_API_KEY",
-        "auth_mode": "header",          # X-API-Key header, not apiKey query param
-        "odds_path": "/odds",           # flat snapshot endpoint (no per-sport path)
-        "sport_key_style": "split",     # soccer_epl -> sport=soccer, league=epl
-        "market_param": "market",       # market values differ from the-odds-api
-        # Soccer market ids verified live against GET /api/v1/markets:
-        # moneyline / point_spread / total_goals ("Total Goals", the standard
-        # Over/Under). NOTE: "total_points" is the catalog id for US sports —
-        # for soccer it returns ZERO rows.
-        "market_map": {
-            "h2h": "moneyline",
-            "spreads": "point_spread",
-            "totals": "total_goals",
-        },
-        "odds_format_param": "odds_format",
-        "response_wrapper": "data",     # odds rows live under the "data" key
-    },    {
-        "name": "sportgameodds",
-        # SportsGameOdds v2 (verified against https://sportsgameodds.com/docs,
-        # Sept 2026 — NOTE the domain is sportsgameodds.com, NOT the
-        # misspelled "sportgameodds.com" previously configured, whose server
-        # never answered). Soccer odds snapshot is GET /v2/events with
-        # leagueID filter (free tier REQUIRES a leagueID/eventID). Auth via
-        # the apiKey query param (x-api-key header also works). Response is
-        # a {"data": [...]} envelope of event objects whose odds live at
-        # odds.<oddID>.byBookmaker.<bookmakerID> with American-format odds.
-        # Free tier: 2,500 objects/month, 10 req/min, only 8 leagues
-        # (soccer: UEFA_CHAMPIONS_LEAGUE + MLS; EPL needs a paid tier).
-        "base_url": os.environ.get(
-            "SPORTSGAMEODDS_BASE_URL",
-            "https://api.sportsgameodds.com/v2",
-        ),
-        "api_key_env": "SPORTGAMEODDS_API_KEY",
-        "auth_mode": "query",
-        "odds_path": "/events",
-        "sport_key_style": "sgo",       # sport key -> leagueID mapping below
-        "league_map": {
-            "soccer_uefa_champs_league": "UEFA_CHAMPIONS_LEAGUE",
-            "soccer_usa_mls": "MLS",
-            "soccer_epl": "EPL",
-        },
-        "response_wrapper": "data",
-    },
-
-]
+# After every provider failed (bad keys, exhausted quotas, outage), wait this
+# many seconds before letting another request retry, so a burst of user
+# requests cannot each trigger a full round of API calls.
+ODDS_FETCH_RETRY_COOLDOWN = int(os.environ.get("ODDS_FETCH_RETRY_COOLDOWN", "600"))
 
 # Bot Configuration
 ADMIN_CHAT_ID = int(os.environ.get("ADMIN_CHAT_ID", "0").strip() or "0")
@@ -224,4 +198,3 @@ ALL_PICK_PROBABILITY_TIERS = [
 # How many candidates the accumulator algorithm will consider. Keeping this
 # bounded avoids pathological O(n^3) behaviour on high-volume days.
 ACCUMULATOR_MAX_CANDIDATES = int(os.environ.get("ACCUMULATOR_MAX_CANDIDATES", "30"))
-

@@ -15,7 +15,6 @@ import copy
 import unittest
 from datetime import datetime, timedelta, timezone
 from unittest import mock
-from zoneinfo import ZoneInfo
 
 import config  # noqa: F401  (loads .env)
 import predictions
@@ -28,7 +27,11 @@ from predictions import (
     get_all_picks,
     _format_pick_description,
 )
-from probability import consensus_probabilities
+from probability import (
+    best_price_and_point,
+    consensus_probabilities,
+    double_chance_odds,
+)
 import odds_client
 import daily_cache
 import formatters
@@ -142,7 +145,10 @@ class OnePickPerMatchUnitTests(unittest.TestCase):
         self.assertEqual(pred["pick"], "Over 2.5 Goals")
         # confidence equals the strongest consensus probability on the event
         totals_probs = consensus_probabilities(self.events[0], market="totals")
-        expected = round(min(totals_probs["Over"]["probability"], 0.99), 2)
+        expected = round(
+            min(totals_probs["Over"]["probability"], 0.99),
+            predictions.CONFIDENCE_DECIMALS,
+        )
         self.assertEqual(pred["confidence"], expected)
 
     def test_duplicate_event_id_processed_once(self):
@@ -522,7 +528,7 @@ def expected_best_rank(event, only_market_type=None):
     bookmakers = event.get("bookmakers", [])
     home_team = event.get("home_team", "Unknown")
     away_team = event.get("away_team", "Unknown")
-    num_bookmakers = len(bookmakers)
+    decimals = predictions.CONFIDENCE_DECIMALS
 
     # Evaluate direct markets
     market_keys = set()
@@ -542,26 +548,16 @@ def expected_best_rank(event, only_market_type=None):
             if probability < 0.40:
                 continue
             probability = min(probability, 0.99)
-            best_odds = None
-            for bookmaker in bookmakers:
-                for mkt in bookmaker.get("markets", []):
-                    if mkt.get("key") != market_type:
-                        continue
-                    for outcome in mkt.get("outcomes", []):
-                        if outcome.get("name") == outcome_name:
-                            price = outcome.get("price", 0)
-                            if best_odds is None or price > best_odds:
-                                best_odds = price
+            best_odds, point = best_price_and_point(event, market_type, outcome_name)
             if best_odds is None or best_odds < 1.01:
                 continue
-            point = predictions._find_outcome_point(bookmakers, market_type, outcome_name)
             pick = predictions._format_pick_description(
                 market_type, outcome_name, point,
                 home_team, away_team, probability,
             )
             if pick is None:
                 continue
-            rank = (round(probability, 2), data["num_bookmakers"], round(best_odds, 2))
+            rank = (round(probability, decimals), data["num_bookmakers"], round(best_odds, 2))
             if best is None or rank > best:
                 best = rank
 
@@ -571,6 +567,7 @@ def expected_best_rank(event, only_market_type=None):
         predictions.calculate_double_chance_probabilities(event)
         if only_market_type in (None, "double_chance") else {}
     )
+    dc_prices = double_chance_odds(event) if dc_probs else {}
     for outcome_name, data in dc_probs.items():
         if data["num_bookmakers"] < 3:
             continue
@@ -578,10 +575,10 @@ def expected_best_rank(event, only_market_type=None):
         if probability < 0.40:
             continue
         probability = min(probability, 0.99)
-        estimated_odds = round(1.0 / probability, 2) if probability > 0 else None
-        if estimated_odds is None or estimated_odds < 1.01:
+        dc_price = dc_prices.get(outcome_name)
+        if dc_price is None or dc_price < 1.01:
             continue
-        rank = (round(probability, 2), data["num_bookmakers"], estimated_odds)
+        rank = (round(probability, decimals), data["num_bookmakers"], round(dc_price, 2))
         if best is None or rank > best:
             best = rank
 
@@ -600,7 +597,7 @@ def expected_best_rank(event, only_market_type=None):
         estimated_odds = round(1.0 / probability, 2) if probability > 0 else None
         if estimated_odds is None or estimated_odds < 1.01:
             continue
-        rank = (round(probability, 2), data["num_bookmakers"], estimated_odds)
+        rank = (round(probability, decimals), data["num_bookmakers"], estimated_odds)
         if best is None or rank > best:
             best = rank
 

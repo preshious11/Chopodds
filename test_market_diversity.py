@@ -408,6 +408,87 @@ class PipelineDiversityTests(unittest.TestCase):
         ]
         self.assertEqual(value_pick_range, [])
 
+    # ------------------------------------------------------------------
+    # Regression: sub-50% selection bug fix
+    # ------------------------------------------------------------------
+
+    def test_stronger_eligible_beats_sub50_diversity_candidate(self):
+        """72% DC must beat 48% BTTS — market diversity cannot displace >=50%."""
+        cands = [
+            make_candidate("m1", "double_chance", 0.72),
+            make_candidate("m1", "btts", 0.48),
+        ]
+        preds = _select_diverse_predictions(cands, max_total=5, min_probability=0.40)
+        self.assertEqual(len(preds), 1, "one pick per match")
+        self.assertAlmostEqual(preds[0]["confidence"], 0.72, places=4)
+        self.assertEqual(preds[0]["market_type"], "double_chance")
+
+    def test_multiple_eligible_markets_diversify_above_50(self):
+        """Four markets all >=50%: diversify while keeping all >=50%."""
+        cands = [
+            make_candidate("m1", "double_chance", 0.72),
+            make_candidate("m1", "btts", 0.55),
+            make_candidate("m2", "totals", 0.53),
+            make_candidate("m3", "h2h", 0.51),
+        ]
+        preds = _select_diverse_predictions(cands, max_total=10, min_probability=0.50)
+        for pred in preds:
+            self.assertGreaterEqual(pred["confidence"], 0.50)
+        self.assertGreaterEqual(len(preds), 3)
+
+    def test_no_above_50_candidates_uses_fallback_floor(self):
+        """When no candidate reaches 50%, the 40% fallback floor still applies."""
+        cands = [
+            make_candidate("m1", "double_chance", 0.48),
+            make_candidate("m2", "btts", 0.45),
+            make_candidate("m3", "totals", 0.42),
+        ]
+        preds = _select_diverse_predictions(cands, max_total=5, min_probability=0.40)
+        self.assertGreater(len(preds), 0, "fallback must still produce picks")
+        for pred in preds:
+            self.assertGreaterEqual(pred["confidence"], 0.40)
+            self.assertLess(pred["confidence"], 0.50)
+
+    def test_low_volume_day_keeps_50pct_candidates_through_market_floors(self):
+        """Low-volume protection: >=50% candidates pass even if below market floors.
+
+        Fewer than MIN_MATCHES_FOR_FULL_QUALITY matches with >=50% candidates
+        bypasses per-market floors, but the plain 50% rule still applies —
+        sub-50% candidates must NOT become valid.
+        """
+        cands = [
+            make_candidate("m1", "double_chance", 0.72),
+            make_candidate("m2", "totals", 0.58),
+            make_candidate("m3", "btts", 0.55),
+            make_candidate("m4", "h2h", 0.52),
+            make_candidate("m5", "btts", 0.48),  # < 50%, must NOT qualify
+        ]
+        preds = _select_diverse_predictions(cands, max_total=10, min_probability=0.50)
+        confidences = [p["confidence"] for p in preds]
+        self.assertGreaterEqual(len(preds), 4, "at least the 4 >=50% candidates")
+        for c in confidences:
+            self.assertGreaterEqual(c, 0.50,
+                                    f"sub-50% candidate leaked: {c:.0%}")
+        self.assertNotIn(0.48, confidences,
+                         "48% BTTS must not be selected when >=50% candidates exist")
+
+    def test_top_picks_never_reintroduce_sub50(self):
+        """Top Picks come from final valid/diversified set, never sub-50%."""
+        cands = [
+            make_candidate("m1", "double_chance", 0.72),
+            make_candidate("m2", "btts", 0.65),
+            make_candidate("m3", "totals", 0.58),
+        ]
+        preds = _select_diverse_predictions(cands, max_total=10, min_probability=0.50)
+        top = get_top_picks(preds, count=2)
+        self.assertGreaterEqual(len(top), 1)
+        for pick in top:
+            self.assertGreaterEqual(pick["confidence"], 0.50,
+                                    f"Top Pick sub-50%: {pick['confidence']:.0%}")
+            self.assertIn(pick, preds,
+                          "Top Pick must come from the final prediction set")
+
+
 
 if __name__ == "__main__":
     unittest.main()

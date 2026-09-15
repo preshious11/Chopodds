@@ -198,6 +198,12 @@ def _select_diverse_predictions(
     effective threshold so the existing low-volume fallback rule (down to
     FALLBACK_PROBABILITY_FLOOR) keeps working on quiet days.
 
+    Preference rule: if any eligible candidate meets the global MIN_PROBABILITY
+    threshold (50%), diversification is restricted to those strong candidates
+    only. Sub-50% fallback candidates are only considered when NO >= 50%
+    candidate exists, so market diversity can never displace a valid
+    high-confidence pick with a weaker sub-50% pick purely for variety.
+
     Never invents predictions: categories with few candidates simply
     contribute few picks.
     """
@@ -207,8 +213,21 @@ def _select_diverse_predictions(
     eligible = [
         p for p in candidates if p.get("confidence", 0.0) >= min_probability
     ]
+    # When the caller passes the standard MIN_PROBABILITY (50%) or higher,
+    # restrict diversification to >=50% candidates whenever any exist, so market
+    # diversity never displaces a valid high-confidence pick with a weaker sub-50%
+    # pick. When the caller passes a lower fallback threshold (e.g. 40% on
+    # low-volume days), all eligible candidates are used for diversity — they are
+    # the valid picks by design in that mode.
+    if min_probability >= config.MIN_PROBABILITY:
+        strong = [
+            p for p in eligible if p.get("confidence", 0.0) >= config.MIN_PROBABILITY
+        ]
+        pool = strong if strong else eligible
+    else:
+        pool = eligible
     ranked = sorted(
-        eligible,
+        pool,
         key=lambda p: (
             -_ranking_score(p),
             -p.get("confidence", 0.0),
